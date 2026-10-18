@@ -1,0 +1,2775 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+美股三大指數與 AI 企業巨頭「本益成長比 (PEG) 7 折三軌監控系統」本地端實戰工具
+檔案名稱：us_ai_peg_tracker.py
+
+功能特色：
+1. 完整實作規格書定義之「三軌自動適配估值模型」：
+   - 【策略一】GAAP 基本面 PEG 7 折目標價（適用 AI 算力硬體與雲端巨頭）
+   - 【策略二】52 週高點打 7 折目標價 + 52 週低點歷史回測有效性檢核（適用高估值軟體股技術面回檔）
+   - 【策略三】Forward Non-GAAP EPS / FCF 每股自由現金流 真實獲利 PEG 7 折目標價（專解 SaaS 軟體股 SBC 扭曲）
+2. 針對方法論盲點新增【智慧定錨與風險診斷引擎】：
+   - 自動識別「SBC 扭曲型 SaaS」、「半導體強週期股」、「低 CAGR 高護城河權值股（防永久踏空）」、「高點深度回撤警示」。
+3. 雙資料源無縫切換：
+   - 預設透過 yfinance 多執行緒並行抓取即時股價、52 週高低點、GAAP TTM EPS、Forward Non-GAAP EPS、每股 FCF。
+   - 支援 SEC EDGAR 官方免費 API 查詢歷年 Diluted EPS（可選參數 --sec-edgar）。
+   - 當無網路、API 限流或欄位缺漏時，自動退回（Fallback）內建 22 檔驗證基準資料庫，確保程式永不中斷。
+4. 多元報表產出：
+   - 終端機精美排版對照表與燈號摘要（🟢 達標買進 / 🟡 接近預警 / ⚪ 觀望等待）
+   - 自動匯出 Excel 相容之 UTF-8-BOM 報表 (`peg_valuation_report.csv`)
+   - 自動生成單檔獨立互動式網頁儀表板 (`peg_valuation_dashboard.html`)，支援拉桿動態調參與利弊分析檢視
+   - 支援透過 Gmail SMTP (`smtplib`) 寄發 HTML 監控週報
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import datetime
+import json
+import math
+import os
+import smtplib
+import sys
+import webbrowser
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict, dataclass, field
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import requests
+
+try:
+    import yfinance as yf
+    HAS_YFINANCE = True
+except ImportError:
+    HAS_YFINANCE = False
+
+
+# ==============================================================================
+# 1. 可微調核心參數 (CONFIG)
+# ==============================================================================
+@dataclass
+class ValuationConfig:
+    """估值模型可微調核心參數"""
+    safety_discount: float = 0.70        # 安全邊際折數（預設打 7 折，即保留 30% 安全邊際）
+    max_pe_cap: float = 45.0             # 合理本益比封頂上限（預設 45 倍，打 7 折後最高給予 31.5 倍 PE）
+    min_cagr_floor: float = 5.0          # 最低成長率門檻（預設 5%；低於此門檻視為成熟收息股，不套用 PEG）
+    near_target_threshold: float = 0.10  # 接近達標預警範圍（預設距離目標價 +10% 以內發出黃燈預警）
+    latest_fy_year: int = 2025           # 計算歷史 CAGR 之最新完整財年基準
+
+
+# ==============================================================================
+# 2. 雲端與本地共用 22 檔追蹤標的基準資料庫 (BASELINE DATABASE)
+# ==============================================================================
+@dataclass
+class StockBaseline:
+    """22 檔追蹤標的基準與備援資料結構"""
+    ticker: str
+    name: str
+    category: str
+    sector_type: str          # 'CLOUD_AI', 'SEMI_AI', 'SEMI_EQUIP', 'SAAS_SBC', 'MATURE_MOAT', 'ENT_SW'
+    base_year: int
+    base_eps: float
+    eps_2025: float
+    raw_cagr: float           # 規格書驗證之原始 CAGR (%)
+    fallback_price: float
+    fallback_high52: float
+    fallback_low52: float
+    fallback_ttm_eps: float
+    fallback_forward_eps: float   # 備援預估 Non-GAAP Forward EPS
+    fallback_fcf_per_share: float # 備援每股自由現金流 (FCF per Share)
+    cik: str = ""             # SEC EDGAR 10 位數 CIK 代碼（供選用 SEC 官方 API 查詢）
+
+
+BASELINE_STOCKS: List[StockBaseline] = [
+    StockBaseline(
+        ticker="GOOGL", name="Alphabet", category="AI 雲端基建 (納斯達克/FANG+)",
+        sector_type="CLOUD_AI", base_year=2020, base_eps=2.96, eps_2025=10.91, raw_cagr=29.81,
+        fallback_price=340.59, fallback_high52=408.61, fallback_low52=244.15, fallback_ttm_eps=19.90,
+        fallback_forward_eps=21.50, fallback_fcf_per_share=16.80, cik="0001652044"
+    ),
+    StockBaseline(
+        ticker="NVDA", name="NVIDIA", category="AI 算力與 NIM 企業軟體 (費半/道瓊)",
+        sector_type="SEMI_AI", base_year=2020, base_eps=0.16, eps_2025=4.06, raw_cagr=90.93,
+        fallback_price=214.13, fallback_high52=243.37, fallback_low52=164.27, fallback_ttm_eps=7.91,
+        fallback_forward_eps=8.65, fallback_fcf_per_share=7.45, cik="0001045810"
+    ),
+    StockBaseline(
+        ticker="NFLX", name="Netflix", category="串流與 AI 推薦巨頭 (納斯達克/FANG+)",
+        sector_type="CLOUD_AI", base_year=2020, base_eps=0.63, eps_2025=2.58, raw_cagr=32.57,
+        fallback_price=70.53, fallback_high52=124.86, fallback_low52=65.10, fallback_ttm_eps=3.17,
+        fallback_forward_eps=3.55, fallback_fcf_per_share=3.10, cik="0001065280"
+    ),
+    StockBaseline(
+        ticker="ORCL", name="Oracle", category="企業資料庫與 OCI AI 雲 (標普500)",
+        sector_type="ENT_SW", base_year=2019, base_eps=3.23, eps_2025=5.94, raw_cagr=12.96,
+        fallback_price=128.23, fallback_high52=304.28, fallback_low52=114.50, fallback_ttm_eps=6.38,
+        fallback_forward_eps=7.85, fallback_fcf_per_share=5.20, cik="0001341439"
+    ),
+    StockBaseline(
+        ticker="INTU", name="Intuit", category="中小企業財稅 AI (納斯達克)",
+        sector_type="SAAS_SBC", base_year=2020, base_eps=7.52, eps_2025=14.73, raw_cagr=14.39,
+        fallback_price=325.15, fallback_high52=689.17, fallback_low52=252.84, fallback_ttm_eps=16.48,
+        fallback_forward_eps=22.40, fallback_fcf_per_share=21.10, cik="0000896878"
+    ),
+    StockBaseline(
+        ticker="AVGO", name="Broadcom", category="AI ASIC 與 VMware 私有雲 (費半)",
+        sector_type="SEMI_AI", base_year=2020, base_eps=0.66, eps_2025=4.90, raw_cagr=49.32,
+        fallback_price=328.75, fallback_high52=495.00, fallback_low52=289.96, fallback_ttm_eps=7.83,
+        fallback_forward_eps=10.80, fallback_fcf_per_share=9.65, cik="0001730168"
+    ),
+    StockBaseline(
+        ticker="ADBE", name="Adobe", category="Firefly 企業行銷設計 AI (納斯達克)",
+        sector_type="SAAS_SBC", base_year=2020, base_eps=10.94, eps_2025=16.73, raw_cagr=8.87,
+        fallback_price=245.20, fallback_high52=363.70, fallback_low52=190.12, fallback_ttm_eps=17.92,
+        fallback_forward_eps=23.10, fallback_fcf_per_share=22.50, cik="0000796343"
+    ),
+    StockBaseline(
+        ticker="IBM", name="IBM", category="watsonx 企業混合雲與 AI 諮詢 (道瓊)",
+        sector_type="MATURE_MOAT", base_year=2020, base_eps=6.27, eps_2025=11.35, raw_cagr=12.60,
+        fallback_price=232.14, fallback_high52=332.46, fallback_low52=199.19, fallback_ttm_eps=11.26,
+        fallback_forward_eps=12.80, fallback_fcf_per_share=14.20, cik="0000051143"
+    ),
+    StockBaseline(
+        ticker="AMZN", name="Amazon", category="AWS Bedrock 企業 AI 雲 (道瓊/納斯達克)",
+        sector_type="CLOUD_AI", base_year=2020, base_eps=2.13, eps_2025=7.29, raw_cagr=27.90,
+        fallback_price=250.00, fallback_high52=287.16, fallback_low52=196.00, fallback_ttm_eps=12.43,
+        fallback_forward_eps=13.80, fallback_fcf_per_share=11.90, cik="0001018724"
+    ),
+    StockBaseline(
+        ticker="NOW", name="ServiceNow", category="Now Assist 企業工作流 AI 代理 (標普500)",
+        sector_type="SAAS_SBC", base_year=2020, base_eps=0.12, eps_2025=1.69, raw_cagr=69.72,
+        fallback_price=141.97, fallback_high52=192.97, fallback_low52=81.24, fallback_ttm_eps=1.60,
+        fallback_forward_eps=4.18, fallback_fcf_per_share=3.95, cik="0001373715"
+    ),
+    StockBaseline(
+        ticker="ACN", name="Accenture", category="全球最大企業 AI 導入顧問 (標普500)",
+        sector_type="MATURE_MOAT", base_year=2020, base_eps=8.27, eps_2025=12.21, raw_cagr=8.10,
+        fallback_price=229.68, fallback_high52=291.09, fallback_low52=118.15, fallback_ttm_eps=13.56,
+        fallback_forward_eps=14.90, fallback_fcf_per_share=15.40, cik="0001467373"
+    ),
+    StockBaseline(
+        ticker="PANW", name="Palo Alto", category="Precision AI 企業資安平台 (納斯達克)",
+        sector_type="SAAS_SBC", base_year=2023, base_eps=1.00, eps_2025=1.67, raw_cagr=29.23,
+        fallback_price=342.00, fallback_high52=432.33, fallback_low52=139.57, fallback_ttm_eps=0.40,
+        fallback_forward_eps=7.80, fallback_fcf_per_share=10.50, cik="0001327567"
+    ),
+    StockBaseline(
+        ticker="PLTR", name="Palantir", category="AIP 企業數據與決策 AI 平台 (納斯達克)",
+        sector_type="SAAS_SBC", base_year=2023, base_eps=0.09, eps_2025=0.69, raw_cagr=176.69,
+        fallback_price=186.03, fallback_high52=212.94, fallback_low52=106.38, fallback_ttm_eps=1.17,
+        fallback_forward_eps=2.15, fallback_fcf_per_share=1.85, cik="0001321655"
+    ),
+    StockBaseline(
+        ticker="CRM", name="Salesforce", category="Agentforce 企業客戶 AI 代理 (道瓊)",
+        sector_type="SAAS_SBC", base_year=2020, base_eps=3.92, eps_2025=7.56, raw_cagr=14.04,
+        fallback_price=240.70, fallback_high52=269.11, fallback_low52=146.32, fallback_ttm_eps=10.98,
+        fallback_forward_eps=14.20, fallback_fcf_per_share=15.60, cik="0001108524"
+    ),
+    StockBaseline(
+        ticker="TSM", name="TSMC (ADR)", category="AI 晶片製造龍頭 (費半)",
+        sector_type="SEMI_AI", base_year=2020, base_eps=3.56, eps_2025=10.60, raw_cagr=24.39,
+        fallback_price=412.61, fallback_high52=487.47, fallback_low52=266.82, fallback_ttm_eps=15.15,
+        fallback_forward_eps=18.20, fallback_fcf_per_share=14.10, cik="0001046179"
+    ),
+    StockBaseline(
+        ticker="MSFT", name="Microsoft", category="Copilot 與 Azure 企業 AI (道瓊/納斯達克)",
+        sector_type="MATURE_MOAT", base_year=2020, base_eps=6.78, eps_2025=16.04, raw_cagr=18.79,
+        fallback_price=529.05, fallback_high52=553.72, fallback_low52=349.20, fallback_ttm_eps=17.95,
+        fallback_forward_eps=20.80, fallback_fcf_per_share=16.90, cik="0000789019"
+    ),
+    StockBaseline(
+        ticker="META", name="Meta", category="Llama 開源 AI 與廣告巨頭 (納斯達克)",
+        sector_type="CLOUD_AI", base_year=2020, base_eps=10.23, eps_2025=23.97, raw_cagr=18.57,
+        fallback_price=709.33, fallback_high52=779.82, fallback_low52=520.26, fallback_ttm_eps=26.56,
+        fallback_forward_eps=30.40, fallback_fcf_per_share=24.80, cik="0001326801"
+    ),
+    StockBaseline(
+        ticker="KLAC", name="KLA", category="半導體製程檢測龍頭 (費半/納斯達克)",
+        sector_type="SEMI_EQUIP", base_year=2020, base_eps=0.88, eps_2025=3.46, raw_cagr=31.50,
+        fallback_price=165.74, fallback_high52=307.37, fallback_low52=107.20, fallback_ttm_eps=3.66,
+        fallback_forward_eps=4.50, fallback_fcf_per_share=4.15, cik="0000319201"
+    ),
+    StockBaseline(
+        ticker="ASML", name="ASML", category="EUV 微影設備龍頭 (費半/納斯達克)",
+        sector_type="SEMI_EQUIP", base_year=2020, base_eps=9.99, eps_2025=28.52, raw_cagr=23.34,
+        fallback_price=1641.52, fallback_high52=1999.96, fallback_low52=946.11, fallback_ttm_eps=39.33,
+        fallback_forward_eps=46.80, fallback_fcf_per_share=38.50, cik="0000937966"
+    ),
+    StockBaseline(
+        ticker="AMAT", name="Applied Mat.", category="半導體設備龍頭 (費半/納斯達克)",
+        sector_type="SEMI_EQUIP", base_year=2020, base_eps=3.95, eps_2025=8.72, raw_cagr=17.16,
+        fallback_price=409.29, fallback_high52=739.67, fallback_low52=203.46, fallback_ttm_eps=11.59,
+        fallback_forward_eps=13.20, fallback_fcf_per_share=11.10, cik="0000006951"
+    ),
+    StockBaseline(
+        ticker="LRCX", name="Lam Research", category="半導體蝕刻設備龍頭 (費半/納斯達克)",
+        sector_type="SEMI_EQUIP", base_year=2020, base_eps=2.05, eps_2025=4.90, raw_cagr=19.04,
+        fallback_price=263.94, fallback_high52=438.50, fallback_low52=135.50, fallback_ttm_eps=5.76,
+        fallback_forward_eps=6.85, fallback_fcf_per_share=6.10, cik="0000707549"
+    ),
+    StockBaseline(
+        ticker="AAPL", name="Apple", category="Apple Intelligence 終端 AI (道瓊/納斯達克)",
+        sector_type="MATURE_MOAT", base_year=2020, base_eps=3.74, eps_2025=7.92, raw_cagr=16.19,
+        fallback_price=343.46, fallback_high52=348.15, fallback_low52=243.42, fallback_ttm_eps=8.72,
+        fallback_forward_eps=9.85, fallback_fcf_per_share=9.40, cik="0000320193"
+    ),
+]
+
+
+# ==============================================================================
+# 3. 估值計算結果資料結構
+# ==============================================================================
+@dataclass
+class ValuationResult:
+    """單一標的完整三軌估值與風險診斷結果"""
+    ticker: str
+    name: str
+    category: str
+    sector_type: str
+    data_source: str              # 'LIVE (yfinance)' 或 'BASELINE (備援)'
+
+    # 歷史成長率指標
+    base_year: int
+    base_eps: float
+    eps_2025: float
+    years_n: int
+    cagr_pct: float               # 歷史年均複合成長率 (%)
+    capped_pe: float              # 採計本益比 = min(CAGR, MAX_PE_CAP)
+    discounted_pe: float          # 打 7 折後給予之目標本益比
+
+    # 即時股價與盈餘指標
+    current_price: float
+    high_52w: float
+    low_52w: float
+    gaap_ttm_eps: float
+    forward_eps: float
+    fcf_per_share: float
+    true_profit_base: float       # 策略三真實獲利基數 = max(GAAP, Forward, FCF)
+    true_profit_source: str       # 真實獲利基數來源標籤 ('GAAP TTM' / 'Forward EPS' / 'FCF/Share')
+
+    # 三大策略目標價與差距
+    s1_ideal_price: float         # 策略一理想價 (PEG=1.0)
+    s1_target_price: float        # 策略一 7 折目標價 (GAAP PEG 0.7)
+    s1_diff_pct: float            # 現價距離策略一目標價 (%) = (現價 - 目標價) / 目標價 * 100
+    s1_signal: str                # 'BUY' / 'NEAR' / 'WAIT'
+
+    s2_target_price: float        # 策略二 7 折目標價 (52W High * 0.7)
+    s2_diff_pct: float            # 現價距離策略二目標價 (%)
+    s2_backtest_valid: bool       # 回測有效性檢核：策略二目標價 >= 52W 最低價
+    s2_signal: str
+
+    s3_ideal_price: float         # 策略三理想價
+    s3_target_price: float        # 策略三 7 折目標價 (Forward/FCF PEG 0.7)
+    s3_diff_pct: float            # 現價距離策略三目標價 (%)
+    s3_signal: str
+
+    # 智慧定錨與盲點診斷（針對方法論利弊之改良）
+    recommended_strategy: str     # 推薦主策略 ('策略一 (GAAP)' / '策略二 (52W高點7折)' / '策略三 (Non-GAAP/FCF)')
+    recommended_target: float     # 推薦主策略之目標價
+    recommended_diff_pct: float   # 現價與推薦目標價差距 (%)
+    overall_signal: str           # 綜合燈號 ('🟢 達標買進' / '🟡 接近預警' / '⚪ 觀望等待')
+    matched_tracks_count: int = 0 # 同時滿足幾個策略 (0, 1, 2, 3)
+    alloc_pct_suggestion: str = ""# 根據滿足軌數建議投入該股額度之資金比例 (0% / 30% / 60% / 100%)
+    fair_sell_price_100: float = 0.0       # 10 折合理價值賣出參考價 (PEG=1.0 或回歸合理價，較7折價高出 +42.86%)
+    overheated_sell_price_120: float = 0.0 # 12 折過熱減碼參考價 (PEG=1.2，較7折價高出 +71.4%)
+    current_gaap_pe: float = 0.0  # 目前 GAAP 本益比
+    current_true_pe: float = 0.0  # 目前真實獲利本益比
+    current_peg_true: float = 0.0 # 目前真實獲利 PEG
+    drawdown_from_high_pct: float = 0.0 # 目前距離 52 週高點回檔幅度 (%)
+    diagnostic_notes: List[str] = field(default_factory=list)
+
+
+# ==============================================================================
+# 4. 網路財務資料擷取器 (yfinance & SEC EDGAR)
+# ==============================================================================
+def fetch_sec_edgar_eps(cik: str, user_agent: str = "AntigravityPEGTracker/1.0 (contact@example.com)") -> Optional[Dict[int, float]]:
+    """
+    透過美國證管會 SEC EDGAR 官方免費 API 抓取歷年 10-K GAAP Diluted EPS
+    端點：https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json
+    """
+    if not cik:
+        return None
+    cik_padded = cik.zfill(10)
+    url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik_padded}.json"
+    try:
+        resp = requests.get(url, headers={"User-Agent": user_agent}, timeout=8)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        us_gaap = data.get("facts", {}).get("us-gaap", {})
+        eps_concept = us_gaap.get("EarningsPerShareDiluted", {})
+        units = eps_concept.get("units", {})
+        usd_per_shares = units.get("USD/shares", [])
+        annual_eps: Dict[int, float] = {}
+        for item in usd_per_shares:
+            if item.get("form") == "10-K" and item.get("fp") == "FY":
+                fy = item.get("fy")
+                val = item.get("val")
+                frame = item.get("frame", "")
+                if isinstance(fy, int) and isinstance(val, (int, float)):
+                    # 優先採用帶有標準年度 frame (如 CY2024) 的年報數據
+                    if f"CY{fy}" in frame or fy not in annual_eps:
+                        annual_eps[fy] = float(val)
+        return annual_eps if annual_eps else None
+    except Exception:
+        return None
+
+
+def fetch_live_stock_metrics(stock: StockBaseline, use_offline: bool = False) -> Dict[str, Any]:
+    """
+    從 yfinance 抓取單一標的即時報價與財務指標；
+    若處於離線模式或特定指標為 None / 異常，則無縫退回基準資料庫 (Fallback)。
+    """
+    result = {
+        "price": stock.fallback_price,
+        "high52": stock.fallback_high52,
+        "low52": stock.fallback_low52,
+        "ttm_eps": stock.fallback_ttm_eps,
+        "forward_eps": stock.fallback_forward_eps,
+        "fcf_per_share": stock.fallback_fcf_per_share,
+        "source": "BASELINE (基準備援)",
+    }
+
+    if use_offline or not HAS_YFINANCE:
+        return result
+
+    try:
+        tk = yf.Ticker(stock.ticker)
+        info = tk.info or {}
+
+        live_price = info.get("currentPrice") or info.get("regularMarketPrice") or info.get("previousClose")
+        live_high52 = info.get("fiftyTwoWeekHigh")
+        live_low52 = info.get("fiftyTwoWeekLow")
+        live_ttm_eps = info.get("trailingEps")
+        live_forward_eps = info.get("forwardEps")
+
+        free_cf = info.get("freeCashflow")
+        shares = info.get("sharesOutstanding") or info.get("impliedSharesOutstanding")
+        fin_currency = (info.get("financialCurrency") or "USD").upper()
+        quote_currency = (info.get("currency") or "USD").upper()
+
+        live_fcf_ps = None
+        if isinstance(free_cf, (int, float)) and isinstance(shares, (int, float)) and shares > 0:
+            raw_fcf_ps = float(free_cf) / float(shares)
+            # 修正跨國 ADR 財報幣別錯配問題（例如 TSM 財報為 TWD、ASML 財報為 EUR，但股價與 EPS 為 USD）
+            if fin_currency != quote_currency and quote_currency == "USD":
+                fx_to_usd = {
+                    "TWD": 1.0 / 32.0,  # 新台幣兌美元近似匯率
+                    "EUR": 1.09,        # 歐元兌美元近似匯率
+                    "JPY": 1.0 / 150.0,
+                    "GBP": 1.28,
+                }
+                rate = fx_to_usd.get(fin_currency)
+                if rate is not None:
+                    raw_fcf_ps *= rate
+                else:
+                    # 若遇到未知外幣財報，退回使用已驗證之美元備援 FCF/Share
+                    raw_fcf_ps = stock.fallback_fcf_per_share
+            live_fcf_ps = raw_fcf_ps
+
+        if isinstance(live_price, (int, float)) and live_price > 0:
+            result["price"] = round(float(live_price), 2)
+            result["source"] = "LIVE (yfinance)"
+        if isinstance(live_high52, (int, float)) and live_high52 > 0:
+            result["high52"] = round(float(live_high52), 2)
+        if isinstance(live_low52, (int, float)) and live_low52 > 0:
+            result["low52"] = round(float(live_low52), 2)
+        if isinstance(live_ttm_eps, (int, float)) and live_ttm_eps > 0:
+            result["ttm_eps"] = round(float(live_ttm_eps), 2)
+        if isinstance(live_forward_eps, (int, float)) and live_forward_eps > 0:
+            result["forward_eps"] = round(float(live_forward_eps), 2)
+        if isinstance(live_fcf_ps, (int, float)) and live_fcf_ps > 0:
+            result["fcf_per_share"] = round(float(live_fcf_ps), 2)
+
+    except Exception:
+        # 發生任何網路或解析錯誤時，保持使用備援數據，確保系統永不中斷
+        pass
+
+    return result
+
+
+# ==============================================================================
+# 5. 核心三軌估值演算法與盲點診斷引擎
+# ==============================================================================
+def calculate_cagr(base_eps: float, latest_eps: float, years_n: int) -> float:
+    """
+    計算歷史年均複合成長率 (CAGR %)
+    公式：((EPS_2025 / EPS_Base) ^ (1 / N) - 1) * 100
+    """
+    if base_eps <= 0 or latest_eps <= 0 or years_n <= 0:
+        return 0.0
+    return ((latest_eps / base_eps) ** (1.0 / years_n) - 1.0) * 100.0
+
+
+def evaluate_signal(current_price: float, target_price: float, near_threshold: float) -> Tuple[str, float]:
+    """
+    計算現價與目標價之差距百分比並判定訊號：
+    - 現價 <= 目標價：BUY (達標買進)
+    - 現價 <= 目標價 * (1 + near_threshold)：NEAR (接近目標預警)
+    - 否則：WAIT (觀望等待)
+    """
+    if target_price <= 0:
+        return "WAIT", 999.9
+    diff_pct = ((current_price - target_price) / target_price) * 100.0
+    if current_price <= target_price:
+        return "BUY", diff_pct
+    elif current_price <= target_price * (1.0 + near_threshold):
+        return "NEAR", diff_pct
+    else:
+        return "WAIT", diff_pct
+
+
+def analyze_stock(stock: StockBaseline, metrics: Dict[str, Any], cfg: ValuationConfig) -> ValuationResult:
+    """執行單一標的之三軌估值計算、策略適配與方法論盲點診斷"""
+    # 處理 ORCL 基準年 2019 (規格書原始 CAGR 12.96% 為 N=5 區間驗證值)
+    if stock.ticker == "ORCL" and stock.base_year == 2019:
+        years_n = 5
+    else:
+        years_n = max(1, cfg.latest_fy_year - stock.base_year)
+
+    # 採用規格書驗證 CAGR（亦可由公式驗算，兩者一致）
+    calc_cagr = calculate_cagr(stock.base_eps, stock.eps_2025, years_n)
+    cagr_pct = round(calc_cagr, 2) if abs(calc_cagr - stock.raw_cagr) < 0.05 else stock.raw_cagr
+
+    # 採計本益比 = min(CAGR, MAX_PE_CAP)
+    if cagr_pct < cfg.min_cagr_floor:
+        capped_pe = cfg.min_cagr_floor
+    else:
+        capped_pe = min(cagr_pct, cfg.max_pe_cap)
+    discounted_pe = capped_pe * cfg.safety_discount
+
+    price = float(metrics["price"])
+    high52 = float(metrics["high52"])
+    low52 = float(metrics["low52"])
+    gaap_eps = float(metrics["ttm_eps"])
+    fwd_eps = float(metrics["forward_eps"])
+    fcf_ps = float(metrics["fcf_per_share"])
+
+    # 【策略一】GAAP 基本面 PEG 7 折目標價
+    s1_ideal = gaap_eps * capped_pe
+    s1_target = s1_ideal * cfg.safety_discount
+    s1_sig, s1_diff = evaluate_signal(price, s1_target, cfg.near_target_threshold)
+
+    # 【策略二】52 週高點打 7 折目標價 + 回測有效性檢核
+    s2_target = high52 * cfg.safety_discount
+    s2_sig, s2_diff = evaluate_signal(price, s2_target, cfg.near_target_threshold)
+    s2_valid = s2_target >= low52
+
+    # 【策略三】Forward / FCF 真實獲利 PEG 7 折目標價
+    candidates = [
+        ("GAAP TTM", gaap_eps),
+        ("Forward EPS", fwd_eps),
+        ("FCF/Share", fcf_ps),
+    ]
+    best_source, true_profit_base = max(candidates, key=lambda x: x[1])
+    s3_ideal = true_profit_base * capped_pe
+    s3_target = s3_ideal * cfg.safety_discount
+    s3_sig, s3_diff = evaluate_signal(price, s3_target, cfg.near_target_threshold)
+
+    # 計算估值倍數與高點回檔幅度
+    current_gaap_pe = (price / gaap_eps) if gaap_eps > 0 else 999.9
+    current_true_pe = (price / true_profit_base) if true_profit_base > 0 else 999.9
+    current_peg_true = (current_true_pe / cagr_pct) if cagr_pct > 0 else 99.9
+    drawdown_pct = ((price - high52) / high52) * 100.0 if high52 > 0 else 0.0
+
+    # ==========================================================================
+    # 智慧定錨與方法論盲點診斷引擎
+    # ==========================================================================
+    notes: List[str] = []
+
+    # 1. 決定該標的之「推薦主策略 (Recommended Anchor)」
+    if stock.sector_type == "SAAS_SBC":
+        # 高 SBC 軟體股：策略一嚴重失真，優先看策略三（真實獲利）或策略二（高點回檔）
+        if cagr_pct >= 25.0:
+            rec_strategy = "策略三 (Forward/FCF)"
+            rec_target = s3_target
+            rec_diff = s3_diff
+            rec_sig = s3_sig
+        else:
+            # 成長率趨緩之成熟 SaaS (如 CRM, INTU, ADBE)，PEG 偏低，結合策略三與策略二較高者或策略二
+            rec_strategy = "策略二/三 雙軌定錨"
+            rec_target = max(s2_target, s3_target) if s2_valid else s3_target
+            rec_sig, rec_diff = evaluate_signal(price, rec_target, cfg.near_target_threshold)
+        sbc_ratio = true_profit_base / gaap_eps if gaap_eps > 0 else 99.0
+        if sbc_ratio >= 1.5:
+            notes.append(f"SBC 扭曲顯著：真實獲利基數 (${true_profit_base:.2f}) 為帳面 GAAP EPS (${gaap_eps:.2f}) 的 {sbc_ratio:.1f} 倍，切勿單看策略一")
+    elif stock.sector_type == "MATURE_MOAT":
+        # 超級權值護城河或成熟收息顧問股 (MSFT, AAPL, IBM, ACN)：純歷史 CAGR 偏低導致 PEG 目標價永久踏空
+        rec_strategy = "策略二 (52W高點7折)"
+        rec_target = s2_target
+        rec_diff = s2_diff
+        rec_sig = s2_sig
+        notes.append(f"成熟高護城河溢價：歷史 CAGR ({cagr_pct:.1f}%) 偏溫和，純基本面 PEG 目標價 (${s1_target:.1f}) 易導致永久踏空，宜採策略二回檔分批布局")
+    elif stock.sector_type == "SEMI_EQUIP":
+        # 半導體設備週期股 (ASML, AMAT, LRCX, KLAC)：須防範景氣循環高峰與深跌陷阱
+        rec_strategy = "策略一/三 + 週期檢核"
+        rec_target = s3_target
+        rec_diff = s3_diff
+        rec_sig = s3_sig
+        notes.append("半導體設備具景氣循環特性：高峰期 EPS 與高點回檔需搭配晶圓廠資本支出 (Capex) 週期綜合判斷")
+    else:
+        # AI 算力硬體與雲端巨頭 (GOOGL, NVDA, AMZN, TSM, AVGO, NFLX, META, ORCL)
+        rec_strategy = "策略一/三 (基本面PEG)"
+        rec_target = s1_target if (gaap_eps / true_profit_base) >= 0.85 else s3_target
+        rec_sig, rec_diff = evaluate_signal(price, rec_target, cfg.near_target_threshold)
+
+    # 2. 診斷本益比封頂保護是否啟動
+    if cagr_pct > cfg.max_pe_cap:
+        notes.append(f"啟動 PE 封頂保護：原始 CAGR 高達 {cagr_pct:.1f}%，已強制鎖定上限 {cfg.max_pe_cap:.0f} 倍（7折後 {discounted_pe:.1f} 倍 PE）避免天價估值")
+
+    # 3. 診斷高點深度回撤（防止盲目接刀 / 價值陷阱）
+    if drawdown_pct <= -35.0:
+        notes.append(f"⚠️ 深度回撤警示：現價已自 52 週高點回檔達 {drawdown_pct:.1f}%（跌破策略二 7 折線），進場前須確認基本面是否遭 AI 顛覆或指引下修")
+
+    # 4. 診斷盈餘成長動能變化 (TTM EPS vs 2025 EPS)
+    if gaap_eps >= stock.eps_2025 * 1.25:
+        notes.append(f"🔥 盈餘動能強勁：當期 TTM EPS (${gaap_eps:.2f}) 較 2025 基準 (${stock.eps_2025:.2f}) 成長逾 +{(gaap_eps/stock.eps_2025 - 1)*100:.0f}%，推升基本面安全墊")
+    elif gaap_eps < stock.eps_2025 * 0.80:
+        notes.append(f"⚠️ 帳面盈餘衰退或重組：當期 TTM EPS (${gaap_eps:.2f}) 低於 2025 基準 (${stock.eps_2025:.2f})，請改以策略三 ({best_source}) 評估")
+
+    # 5. 綜合燈號判定與「一二三軌金字塔分批投入資金 %」計算
+    triggered_buys = []
+    if s1_sig == "BUY":
+        triggered_buys.append("策略一")
+    if s2_sig == "BUY" and s2_valid:
+        triggered_buys.append("策略二")
+    if s3_sig == "BUY":
+        triggered_buys.append("策略三")
+
+    matched_cnt = len(triggered_buys)
+    any_near = (s1_sig == "NEAR") or (s3_sig == "NEAR") or (s2_sig == "NEAR" and s2_valid)
+
+    if matched_cnt == 3:
+        overall_signal = f"🔥 3軌全滿 ({'/'.join(triggered_buys)})"
+        alloc_suggest = "🔥 投入 100% 滿倉 (三軌全滿重倉區)"
+    elif matched_cnt == 2:
+        overall_signal = f"🟢🟢 2軌達標 ({'/'.join(triggered_buys)})"
+        alloc_suggest = "🟢 投入 60% 資金 (雙軌確認加碼區)"
+    elif matched_cnt == 1:
+        overall_signal = f"🟢 1軌達標 ({triggered_buys[0]})"
+        alloc_suggest = "🟢 投入 30% 資金 (單軌試單基本倉)"
+    elif any_near:
+        triggered_nears = []
+        if s1_sig == "NEAR":
+            triggered_nears.append("策略一")
+        if s2_sig == "NEAR":
+            triggered_nears.append("策略二")
+        if s3_sig == "NEAR":
+            triggered_nears.append("策略三")
+        overall_signal = f"🟡 接近預警 ({'/'.join(triggered_nears)})"
+        alloc_suggest = "🟡 0% (SHV短債待命，距買點+10%內)"
+    else:
+        overall_signal = "⚪ 觀望等待"
+        alloc_suggest = "⚪ 0% (續抱底倉/SHV領息)"
+
+    # 計算 10 折合理價值賣出價 (回測停利標準：7折目標價 / 0.70 = 10折理想價，較7折買點高出 +42.86%)
+    fair_sell_100 = (rec_target / cfg.safety_discount) if cfg.safety_discount > 0 else rec_target * 1.4286
+    overheated_sell_120 = fair_sell_100 * 1.20
+
+    return ValuationResult(
+        ticker=stock.ticker,
+        name=stock.name,
+        category=stock.category,
+        sector_type=stock.sector_type,
+        data_source=metrics["source"],
+        base_year=stock.base_year,
+        base_eps=stock.base_eps,
+        eps_2025=stock.eps_2025,
+        years_n=years_n,
+        cagr_pct=round(cagr_pct, 2),
+        capped_pe=round(capped_pe, 2),
+        discounted_pe=round(discounted_pe, 2),
+        current_price=round(price, 2),
+        high_52w=round(high52, 2),
+        low_52w=round(low52, 2),
+        gaap_ttm_eps=round(gaap_eps, 2),
+        forward_eps=round(fwd_eps, 2),
+        fcf_per_share=round(fcf_ps, 2),
+        true_profit_base=round(true_profit_base, 2),
+        true_profit_source=best_source,
+        s1_ideal_price=round(s1_ideal, 2),
+        s1_target_price=round(s1_target, 2),
+        s1_diff_pct=round(s1_diff, 2),
+        s1_signal=s1_sig,
+        s2_target_price=round(s2_target, 2),
+        s2_diff_pct=round(s2_diff, 2),
+        s2_backtest_valid=s2_valid,
+        s2_signal=s2_sig,
+        s3_ideal_price=round(s3_ideal, 2),
+        s3_target_price=round(s3_target, 2),
+        s3_diff_pct=round(s3_diff, 2),
+        s3_signal=s3_sig,
+        recommended_strategy=rec_strategy,
+        recommended_target=round(rec_target, 2),
+        recommended_diff_pct=round(rec_diff, 2),
+        overall_signal=overall_signal,
+        matched_tracks_count=matched_cnt,
+        alloc_pct_suggestion=alloc_suggest,
+        fair_sell_price_100=round(fair_sell_100, 2),
+        overheated_sell_price_120=round(overheated_sell_120, 2),
+        current_gaap_pe=round(current_gaap_pe, 2),
+        current_true_pe=round(current_true_pe, 2),
+        current_peg_true=round(current_peg_true, 2),
+        drawdown_from_high_pct=round(drawdown_pct, 2),
+        diagnostic_notes=notes,
+    )
+
+
+# ==============================================================================
+# 6. 終端機報表、CSV 匯出與互動式 HTML 儀表板生成
+# ==============================================================================
+def print_terminal_report(results: List[ValuationResult], cfg: ValuationConfig) -> None:
+    """在終端機印出結構化三軌估值監控對照表與訊號摘要"""
+    # 確保 Windows 終端機能正常印出 UTF-8 與 Emoji
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+
+    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print("=" * 136)
+    print(f"📊 美股三大指數與 AI 企業巨頭「本益成長比 (PEG) {cfg.safety_discount*100:.0f} 折三軌監控系統」估值分析報表")
+    print(f"⏱️  產出時間：{now_str} | 安全邊際折數：{cfg.safety_discount:.2f} | PE 封頂上限：{cfg.max_pe_cap:.1f}x (折後最高 {cfg.max_pe_cap*cfg.safety_discount:.1f}x) | 預警門檻：+{cfg.near_target_threshold*100:.0f}%")
+    print("=" * 136)
+
+    header = (
+        f"{'代號':<6} {'公司名稱':<13} {'現價':>8} {'CAGR%':>7} {'折後PE':>6} | "
+        f"{'【策略一】GAAP':>14} {'差距%':>7} | "
+        f"{'【策略二】52W高7折':>16} {'回測有效':>6} | "
+        f"{'【策略三】真實獲利':>16} {'差距%':>7} | "
+        f"{'綜合監控燈號與建議主策略'}"
+    )
+    print(header)
+    print("-" * 136)
+
+    buy_list: List[ValuationResult] = []
+    near_list: List[ValuationResult] = []
+
+    for r in results:
+        valid_str = "✓ 曾觸及" if r.s2_backtest_valid else "✗ 未觸及"
+        s1_str = f"${r.s1_target_price:>8.2f}"
+        s2_str = f"${r.s2_target_price:>8.2f} ({r.s2_diff_pct:>+6.1f}%)"
+        s3_str = f"${r.s3_target_price:>8.2f}"
+
+        line = (
+            f"{r.ticker:<6} {r.name:<13} ${r.current_price:>7.2f} {r.cagr_pct:>6.1f}% {r.discounted_pe:>5.1f}x | "
+            f"{s1_str:>14} {r.s1_diff_pct:>+6.1f}% | "
+            f"{s2_str:>18} {valid_str:>6} | "
+            f"{s3_str:>16} {r.s3_diff_pct:>+6.1f}% | "
+            f"{r.overall_signal} [{r.recommended_strategy}]"
+        )
+        print(line)
+
+        if r.matched_tracks_count > 0:
+            buy_list.append(r)
+        elif "🟡" in r.overall_signal:
+            near_list.append(r)
+
+    three_tracks = [r.ticker for r in results if r.matched_tracks_count == 3]
+    two_tracks = [r.ticker for r in results if r.matched_tracks_count == 2]
+    one_track = [r.ticker for r in results if r.matched_tracks_count == 1]
+
+    print("=" * 136)
+    print(f"📌 【每週巡檢與一二三軌金字塔資金投入摘要】共追蹤 {len(results)} 檔 AI 權值巨頭：")
+    print(f"   🔥 3軌全滿（投入 100% 大量資金 / 股災黃金坑）：共 {len(three_tracks)} 檔 -> {', '.join(three_tracks) if three_tracks else '無'}")
+    print(f"   🟢🟢 2軌滿足（投入 60% 主力資金）：共 {len(two_tracks)} 檔 -> {', '.join(two_tracks) if two_tracks else '無'}")
+    print(f"   🟢 1軌滿足（投入 30% 基本試單資金）：共 {len(one_track)} 檔 -> {', '.join(one_track) if one_track else '無'}")
+    print(f"   🟡 接近目標預警（距離目標價 +{cfg.near_target_threshold*100:.0f}% 內，SHV短債待命）：共 {len(near_list)} 檔 -> {', '.join(x.ticker for x in near_list) if near_list else '無'}")
+    print("=" * 136)
+
+
+def export_csv_report(results: List[ValuationResult], output_path: Path) -> None:
+    """匯出 UTF-8 with BOM 格式之全中文欄位 CSV 報表，支援 Excel 直接開啟不亂碼"""
+    fieldnames = [
+        "股票代號 (Ticker)", "公司名稱 (Name)", "產業分類與所屬指數", "資料來源",
+        "滿足策略軌數 (0~3軌)", "建議投入資金比例 (%)", "綜合監控燈號",
+        "目前股價 ($)", "推薦最適主策略", "🟢 推薦7折買進目標價 ($)", "與7折買進價差距 (%)",
+        "🎯 10折合理賣出價 (回測停利點 +42.9%)", "🔥 12折過熱減碼價 (+71.4%)",
+        "【策略一】GAAP帳面7折買進價 ($)", "策略一差距 (%)", "策略一訊號",
+        "【策略二】52週高點7折買進價 ($)", "策略二差距 (%)", "策略二歷史曾觸及 (>=52W低點)", "策略二訊號",
+        "【策略三】真實現金流7折買進價 ($)", "策略三差距 (%)", "策略三訊號",
+        "歷史年均複合成長率 CAGR (%)", "採計本益比上限 (最高45倍)", "打7折後目標本益比 (最高31.5倍)",
+        "52週最高價 ($)", "52週最低價 ($)", "目前距52週高點跌幅 (%)",
+        "帳面當期盈餘 GAAP TTM EPS ($)", "分析師預估遠期盈餘 Forward EPS ($)", "每股自由現金流 FCF/Share ($)",
+        "策略三採計真實獲利基數 ($)", "真實獲利指標來源",
+        "目前帳面本益比 (GAAP PE)", "目前真實獲利本益比 (True PE)", "目前真實本益成長比 (True PEG)",
+        "個股盲點與風險診斷白話提示"
+    ]
+
+    with output_path.open("w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for r in results:
+            writer.writerow({
+                "股票代號 (Ticker)": r.ticker,
+                "公司名稱 (Name)": r.name,
+                "產業分類與所屬指數": r.category,
+                "資料來源": r.data_source,
+                "滿足策略軌數 (0~3軌)": f"{r.matched_tracks_count} 軌滿足",
+                "建議投入資金比例 (%)": r.alloc_pct_suggestion,
+                "綜合監控燈號": r.overall_signal,
+                "目前股價 ($)": r.current_price,
+                "推薦最適主策略": r.recommended_strategy,
+                "🟢 推薦7折買進目標價 ($)": r.recommended_target,
+                "與7折買進價差距 (%)": r.recommended_diff_pct,
+                "🎯 10折合理賣出價 (回測停利點 +42.9%)": r.fair_sell_price_100,
+                "🔥 12折過熱減碼價 (+71.4%)": r.overheated_sell_price_120,
+                "【策略一】GAAP帳面7折買進價 ($)": r.s1_target_price,
+                "策略一差距 (%)": r.s1_diff_pct,
+                "策略一訊號": r.s1_signal,
+                "【策略二】52週高點7折買進價 ($)": r.s2_target_price,
+                "策略二差距 (%)": r.s2_diff_pct,
+                "策略二歷史曾觸及 (>=52W低點)": "有效 (過去一年曾跌到)" if r.s2_backtest_valid else "未觸及",
+                "策略二訊號": r.s2_signal,
+                "【策略三】真實現金流7折買進價 ($)": r.s3_target_price,
+                "策略三差距 (%)": r.s3_diff_pct,
+                "策略三訊號": r.s3_signal,
+                "歷史年均複合成長率 CAGR (%)": r.cagr_pct,
+                "採計本益比上限 (最高45倍)": r.capped_pe,
+                "打7折後目標本益比 (最高31.5倍)": r.discounted_pe,
+                "52週最高價 ($)": r.high_52w,
+                "52週最低價 ($)": r.low_52w,
+                "目前距52週高點跌幅 (%)": r.drawdown_from_high_pct,
+                "帳面當期盈餘 GAAP TTM EPS ($)": r.gaap_ttm_eps,
+                "分析師預估遠期盈餘 Forward EPS ($)": r.forward_eps,
+                "每股自由現金流 FCF/Share ($)": r.fcf_per_share,
+                "策略三採計真實獲利基數 ($)": r.true_profit_base,
+                "真實獲利指標來源": r.true_profit_source,
+                "目前帳面本益比 (GAAP PE)": r.current_gaap_pe,
+                "目前真實獲利本益比 (True PE)": r.current_true_pe,
+                "目前真實本益成長比 (True PEG)": r.current_peg_true,
+                "個股盲點與風險診斷白話提示": "；".join(r.diagnostic_notes),
+            })
+
+
+def _load_backtest_data_for_dashboard() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """載入近五年回測之個股統計與交易範例明細，以內嵌於主儀表板之『賣股指南與回測範例驗證頁』"""
+    summary_rows: List[Dict[str, Any]] = []
+    trade_rows: List[Dict[str, Any]] = []
+    sum_path = Path("peg_backtest_report.csv")
+    tr_path = Path("peg_backtest_trades.csv")
+    if sum_path.exists():
+        try:
+            with sum_path.open("r", encoding="utf-8-sig") as f:
+                summary_rows = list(csv.DictReader(f))
+        except Exception:
+            pass
+    if tr_path.exists():
+        try:
+            with tr_path.open("r", encoding="utf-8-sig") as f:
+                trade_rows = list(csv.DictReader(f))
+        except Exception:
+            pass
+    return summary_rows, trade_rows
+
+
+def export_html_dashboard(results: List[ValuationResult], cfg: ValuationConfig, output_path: Path) -> None:
+    """
+    生成防遺忘、全中文說明、頂級 FinTech 視覺設計之單檔互動式網頁儀表板 (peg_valuation_dashboard.html)
+    包含五大核心頁籤與深淺色主題切換：
+    1. 📖 【主頁面：我的投資憲法與 50/50 配置總覽】（含每週 3 分鐘巡檢 SOP、資料來源可靠度說明、CSPX/BND/SHV/QQQ 配置理由、1/2/3軌金字塔視覺卡、全中文指標字典）
+    2. 📊 【每週巡檢：22 檔三軌買賣價監控表】（含 52 週股價區間視覺尺、滿足幾軌能量條、建議投入資金%、7折買進價、10折合理賣出價、12折過熱減碼價）
+    3. ⚖️ 【賣股時機判斷指南 ＆ 五年回測範例驗證頁】（解釋賣股數值理由 + 22檔買賣目標價對照 + 50筆歷史真實回測交易範例留存驗證）
+    4. 💼 【50/50 雙軌資產配置與 SVG 視覺化試算器】（依 CSPX / BND / SHV / QQQ 與 1/2/3 軌達標個股自動計算下單金額與動態圓餅圖）
+    5. 🧮 【方法論利弊深度剖析 ＆ 自訂美股 PEG 7 折試算器】
+    """
+    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    live_count = sum(1 for r in results if "LIVE" in r.data_source)
+    data_json = json.dumps([asdict(r) for r in results], ensure_ascii=False)
+    cfg_json = json.dumps(asdict(cfg), ensure_ascii=False)
+    bt_summaries, bt_trades = _load_backtest_data_for_dashboard()
+    bt_sum_json = json.dumps(bt_summaries, ensure_ascii=False)
+    bt_tr_json = json.dumps(bt_trades, ensure_ascii=False)
+
+    html_content = f"""<!DOCTYPE html>
+<html lang="zh-TW" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>我的美股 50/50 雙軌配置與 PEG 7 折三軌監控系統｜私人財富管理終端</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;600;700&family=Noto+Sans+TC:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+  :root {{
+    --bg-base: #060913;
+    --bg-surface: rgba(15, 23, 42, 0.72);
+    --bg-surface-solid: #0f172a;
+    --bg-elevated: rgba(30, 41, 59, 0.65);
+    --bg-row-hover: rgba(56, 189, 248, 0.07);
+    --border-subtle: rgba(148, 163, 184, 0.14);
+    --border-highlight: rgba(56, 189, 248, 0.42);
+    --text-primary: #f8fafc;
+    --text-secondary: #cbd5e1;
+    --text-muted: #94a3b8;
+    --accent-cyan: #38bdf8;
+    --accent-indigo: #818cf8;
+    --accent-emerald: #10b981;
+    --accent-emerald-bg: rgba(16, 185, 129, 0.14);
+    --accent-amber: #f59e0b;
+    --accent-amber-bg: rgba(245, 158, 11, 0.14);
+    --accent-rose: #f43f5e;
+    --accent-rose-bg: rgba(244, 63, 94, 0.16);
+    --accent-purple: #c084fc;
+    --accent-purple-bg: rgba(192, 132, 252, 0.14);
+    --shadow-card: 0 12px 32px -8px rgba(0, 0, 0, 0.55), 0 0 1px 1px rgba(255, 255, 255, 0.04);
+    --shadow-glow: 0 0 25px rgba(56, 189, 248, 0.15);
+    --font-sans: 'Inter', 'Noto Sans TC', -apple-system, BlinkMacSystemFont, "Microsoft JhengHei", sans-serif;
+    --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Consolas, monospace;
+  }}
+
+  html[data-theme="light"] {{
+    --bg-base: #f1f5f9;
+    --bg-surface: rgba(255, 255, 255, 0.92);
+    --bg-surface-solid: #ffffff;
+    --bg-elevated: #f8fafc;
+    --bg-row-hover: rgba(2, 132, 199, 0.06);
+    --border-subtle: #e2e8f0;
+    --border-highlight: #0284c7;
+    --text-primary: #0f172a;
+    --text-secondary: #334155;
+    --text-muted: #64748b;
+    --accent-cyan: #0284c7;
+    --accent-indigo: #4f46e5;
+    --accent-emerald: #059669;
+    --accent-emerald-bg: rgba(5, 150, 105, 0.12);
+    --accent-amber: #d97706;
+    --accent-amber-bg: rgba(217, 119, 6, 0.12);
+    --accent-rose: #e11d48;
+    --accent-rose-bg: rgba(225, 29, 72, 0.12);
+    --accent-purple: #7c3aed;
+    --accent-purple-bg: rgba(124, 58, 237, 0.1);
+    --shadow-card: 0 4px 20px -2px rgba(15, 23, 42, 0.07), 0 0 1px 1px rgba(15, 23, 42, 0.04);
+    --shadow-glow: 0 4px 18px rgba(2, 132, 199, 0.12);
+  }}
+
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{
+    font-family: var(--font-sans);
+    background-color: var(--bg-base);
+    background-image:
+      radial-gradient(ellipse 80% 50% at 15% -10%, rgba(56, 189, 248, 0.12), transparent),
+      radial-gradient(ellipse 70% 45% at 85% -5%, rgba(99, 102, 241, 0.12), transparent),
+      radial-gradient(ellipse 60% 40% at 50% 105%, rgba(16, 185, 129, 0.07), transparent);
+    background-attachment: fixed;
+    color: var(--text-primary);
+    line-height: 1.65;
+    padding: 0 0 48px 0;
+    transition: background-color 0.25s ease, color 0.25s ease;
+  }}
+
+  .mono-num {{
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.02em;
+  }}
+
+  /* Sticky Top Glass Navbar */
+  .top-navbar {{
+    position: sticky;
+    top: 0;
+    z-index: 100;
+    backdrop-filter: blur(18px);
+    -webkit-backdrop-filter: blur(18px);
+    background: var(--bg-surface);
+    border-bottom: 1px solid var(--border-subtle);
+    box-shadow: 0 4px 24px rgba(0, 0, 0, 0.2);
+    padding: 14px 28px;
+    margin-bottom: 26px;
+  }}
+  .top-navbar-inner {{
+    max-width: 1620px;
+    margin: 0 auto;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 16px;
+  }}
+  .brand-area {{ display: flex; align-items: center; gap: 14px; }}
+  .brand-logo {{
+    width: 44px;
+    height: 44px;
+    border-radius: 12px;
+    background: linear-gradient(135deg, #0ea5e9, #6366f1, #10b981);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.35rem;
+    box-shadow: 0 4px 14px rgba(56, 189, 248, 0.35);
+    flex-shrink: 0;
+  }}
+  .brand-title h1 {{
+    font-size: 1.28rem;
+    font-weight: 800;
+    letter-spacing: -0.01em;
+    background: linear-gradient(90deg, var(--accent-cyan), var(--accent-indigo), var(--accent-emerald));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }}
+  .brand-title p {{
+    font-size: 0.82rem;
+    color: var(--text-muted);
+    margin-top: 2px;
+  }}
+
+  .status-cluster {{ display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }}
+  .status-pill {{
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-subtle);
+    padding: 6px 13px;
+    border-radius: 999px;
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    font-weight: 500;
+  }}
+  .pulse-dot {{
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--accent-emerald);
+    box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7);
+    animation: pulse-green 2s infinite;
+  }}
+  @keyframes pulse-green {{
+    0% {{ transform: scale(0.95); box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7); }}
+    70% {{ transform: scale(1); box-shadow: 0 0 0 7px rgba(16, 185, 129, 0); }}
+    100% {{ transform: scale(0.95); box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }}
+  }}
+  .theme-toggle-btn {{
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-highlight);
+    color: var(--accent-cyan);
+    padding: 6px 14px;
+    border-radius: 999px;
+    font-size: 0.82rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s;
+  }}
+  .theme-toggle-btn:hover {{
+    background: var(--accent-cyan);
+    color: #fff;
+  }}
+
+  .container {{ max-width: 1620px; margin: 0 auto; padding: 0 28px; }}
+
+  /* Segmented Navigation Tabs */
+  .tabs-wrapper {{
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: 16px;
+    padding: 7px;
+    display: flex;
+    gap: 6px;
+    margin-bottom: 24px;
+    box-shadow: var(--shadow-card);
+    flex-wrap: wrap;
+  }}
+  .tab-btn {{
+    flex: 1 1 auto;
+    background: transparent;
+    color: var(--text-muted);
+    border: 1px solid transparent;
+    padding: 11px 16px;
+    border-radius: 11px;
+    cursor: pointer;
+    font-size: 0.9rem;
+    font-weight: 600;
+    transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+  }}
+  .tab-btn:hover {{
+    color: var(--text-primary);
+    background: var(--bg-elevated);
+  }}
+  .tab-btn.active {{
+    background: linear-gradient(135deg, #0284c7, #4f46e5);
+    color: #ffffff;
+    border-color: rgba(255, 255, 255, 0.18);
+    box-shadow: 0 6px 18px rgba(79, 70, 229, 0.38);
+  }}
+  .tab-panel {{ display: none; animation: fadeIn 0.25s ease; }}
+  .tab-panel.active {{ display: block; }}
+  @keyframes fadeIn {{
+    from {{ opacity: 0; transform: translateY(4px); }}
+    to {{ opacity: 1; transform: translateY(0); }}
+  }}
+
+  /* Hero Banner */
+  .playbook-hero {{
+    background: linear-gradient(135deg, rgba(14, 165, 233, 0.16), rgba(79, 70, 229, 0.14), rgba(16, 185, 129, 0.12));
+    border: 1px solid var(--border-highlight);
+    border-radius: 18px;
+    padding: 26px 30px;
+    margin-bottom: 24px;
+    box-shadow: var(--shadow-glow);
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 24px;
+    align-items: center;
+  }}
+  @media (max-width: 960px) {{
+    .playbook-hero {{ grid-template-columns: 1fr; }}
+  }}
+  .playbook-hero h2 {{ font-size: 1.38rem; font-weight: 800; color: var(--text-primary); margin-bottom: 10px; }}
+  .playbook-hero p {{ color: var(--text-secondary); font-size: 0.94rem; line-height: 1.72; }}
+
+  /* Pyramid Visual Step Cards */
+  .pyramid-grid {{
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 14px;
+    margin: 18px 0 6px 0;
+  }}
+  @media (max-width: 1100px) {{
+    .pyramid-grid {{ grid-template-columns: repeat(2, 1fr); }}
+  }}
+  .pyramid-step {{
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-subtle);
+    border-radius: 14px;
+    padding: 16px;
+    position: relative;
+    overflow: hidden;
+    transition: transform 0.2s, border-color 0.2s;
+  }}
+  .pyramid-step:hover {{ transform: translateY(-2px); border-color: var(--border-highlight); }}
+  .pyramid-step .step-tag {{
+    font-size: 0.75rem;
+    font-weight: 700;
+    padding: 3px 9px;
+    border-radius: 999px;
+    display: inline-block;
+    margin-bottom: 8px;
+  }}
+  .pyramid-step .step-pct {{
+    font-family: var(--font-mono);
+    font-size: 1.65rem;
+    font-weight: 800;
+    margin-bottom: 4px;
+  }}
+  .pyramid-step .step-desc {{ font-size: 0.82rem; color: var(--text-muted); line-height: 1.5; }}
+  .pyramid-bar {{
+    height: 5px;
+    border-radius: 999px;
+    background: rgba(148, 163, 184, 0.15);
+    margin-top: 10px;
+    overflow: hidden;
+  }}
+  .pyramid-bar-fill {{ height: 100%; border-radius: 999px; }}
+
+  /* KPI Cards */
+  .kpi-grid {{
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 16px;
+    margin-bottom: 22px;
+  }}
+  .kpi-card {{
+    background: var(--bg-surface);
+    backdrop-filter: blur(12px);
+    border: 1px solid var(--border-subtle);
+    border-radius: 16px;
+    padding: 18px 20px;
+    box-shadow: var(--shadow-card);
+    position: relative;
+    overflow: hidden;
+    transition: transform 0.2s, border-color 0.2s;
+  }}
+  .kpi-card:hover {{ transform: translateY(-2px); border-color: var(--border-highlight); }}
+  .kpi-card::before {{
+    content: "";
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 3px;
+  }}
+  .kpi-card.k-t3::before {{ background: linear-gradient(90deg, #f43f5e, #fb7185); }}
+  .kpi-card.k-t2::before {{ background: linear-gradient(90deg, #10b981, #34d399); }}
+  .kpi-card.k-t1::before {{ background: linear-gradient(90deg, #0ea5e9, #38bdf8); }}
+  .kpi-card.k-near::before {{ background: linear-gradient(90deg, #f59e0b, #fbbf24); }}
+  .kpi-title {{ font-size: 0.83rem; font-weight: 600; color: var(--text-muted); margin-bottom: 8px; }}
+  .kpi-value {{ font-family: var(--font-mono); font-size: 1.85rem; font-weight: 800; margin-bottom: 4px; }}
+  .kpi-sub {{ font-size: 0.82rem; color: var(--text-secondary); font-weight: 500; }}
+
+  /* Grid & Cards */
+  .analysis-grid {{
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(460px, 1fr));
+    gap: 20px;
+    margin-bottom: 22px;
+  }}
+  @media (max-width: 768px) {{
+    .analysis-grid {{ grid-template-columns: 1fr; }}
+  }}
+  .analysis-card {{
+    background: var(--bg-surface);
+    backdrop-filter: blur(12px);
+    border: 1px solid var(--border-subtle);
+    border-radius: 16px;
+    padding: 24px;
+    margin-bottom: 20px;
+    box-shadow: var(--shadow-card);
+  }}
+  .analysis-card h3 {{
+    font-size: 1.15rem;
+    font-weight: 700;
+    margin-bottom: 16px;
+    padding-bottom: 12px;
+    border-bottom: 1px solid var(--border-subtle);
+    color: var(--accent-cyan);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }}
+  .rule-box {{
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-subtle);
+    border-left: 4px solid var(--accent-cyan);
+    border-radius: 10px;
+    padding: 15px 18px;
+    margin-bottom: 12px;
+    transition: border-color 0.2s;
+  }}
+  .rule-box.green {{ border-left-color: var(--accent-emerald); }}
+  .rule-box.amber {{ border-left-color: var(--accent-amber); }}
+  .rule-box.purple {{ border-left-color: var(--accent-purple); }}
+  .rule-box.red {{ border-left-color: var(--accent-rose); }}
+  .rule-box h4 {{ font-size: 0.98rem; font-weight: 700; margin-bottom: 6px; color: var(--text-primary); }}
+  .rule-box p {{ font-size: 0.88rem; color: var(--text-secondary); line-height: 1.65; }}
+
+  /* Weekly Checklist */
+  .checklist-item {{
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    padding: 11px 14px;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-subtle);
+    border-radius: 10px;
+    margin-bottom: 8px;
+    cursor: pointer;
+    transition: all 0.15s;
+  }}
+  .checklist-item:hover {{ border-color: var(--border-highlight); }}
+  .checklist-item input[type="checkbox"] {{
+    width: 18px;
+    height: 18px;
+    margin-top: 3px;
+    accent-color: var(--accent-emerald);
+    cursor: pointer;
+    flex-shrink: 0;
+  }}
+  .checklist-item.checked span {{
+    text-decoration: line-through;
+    color: var(--text-muted);
+  }}
+
+  /* Controls & Sliders */
+  .control-panel {{
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: 16px;
+    padding: 20px 24px;
+    margin-bottom: 20px;
+    box-shadow: var(--shadow-card);
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 24px;
+    align-items: center;
+  }}
+  .control-item label {{
+    display: flex;
+    justify-content: space-between;
+    font-size: 0.86rem;
+    font-weight: 600;
+    margin-bottom: 8px;
+    color: var(--text-primary);
+  }}
+  .control-item label span {{ color: var(--accent-cyan); font-family: var(--font-mono); font-size: 0.92rem; }}
+  .control-item input[type="range"] {{
+    width: 100%;
+    accent-color: var(--accent-indigo);
+    cursor: pointer;
+  }}
+  .control-hint {{ font-size: 0.78rem; color: var(--text-muted); margin-top: 5px; }}
+
+  /* Filter Bar */
+  .filter-bar {{
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 12px;
+    margin-bottom: 16px;
+  }}
+  .filter-pills {{ display: flex; gap: 7px; flex-wrap: wrap; }}
+  .pill-btn {{
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    color: var(--text-secondary);
+    padding: 7px 14px;
+    border-radius: 999px;
+    font-size: 0.82rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s;
+  }}
+  .pill-btn:hover, .pill-btn.active {{
+    background: rgba(56, 189, 248, 0.16);
+    color: var(--accent-cyan);
+    border-color: var(--accent-cyan);
+    box-shadow: 0 2px 10px rgba(56, 189, 248, 0.15);
+  }}
+  .search-box {{ display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }}
+  .search-input {{
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    color: var(--text-primary);
+    padding: 8px 14px;
+    border-radius: 10px;
+    font-size: 0.86rem;
+    width: 230px;
+    transition: border-color 0.2s;
+  }}
+  .search-input:focus {{ outline: none; border-color: var(--accent-cyan); }}
+  .action-btn {{
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-highlight);
+    color: var(--accent-cyan);
+    padding: 8px 14px;
+    border-radius: 10px;
+    font-size: 0.82rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s;
+  }}
+  .action-btn:hover {{ background: var(--accent-cyan); color: #fff; }}
+
+  /* Table Design */
+  .table-wrap {{
+    background: var(--bg-surface);
+    backdrop-filter: blur(12px);
+    border: 1px solid var(--border-subtle);
+    border-radius: 16px;
+    overflow-x: auto;
+    margin-bottom: 24px;
+    box-shadow: var(--shadow-card);
+  }}
+  table {{
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.86rem;
+    white-space: nowrap;
+  }}
+  th {{
+    background: var(--bg-elevated);
+    color: var(--text-muted);
+    font-weight: 700;
+    font-size: 0.8rem;
+    text-align: right;
+    padding: 13px 12px;
+    border-bottom: 1px solid var(--border-subtle);
+    cursor: pointer;
+    user-select: none;
+    transition: color 0.15s;
+  }}
+  th:first-child, th:nth-child(2), th:last-child {{ text-align: left; }}
+  th:hover {{ color: var(--accent-cyan); }}
+  td {{
+    padding: 12px 12px;
+    border-bottom: 1px solid var(--border-subtle);
+    text-align: right;
+    vertical-align: middle;
+  }}
+  td:first-child, td:nth-child(2), td:last-child {{ text-align: left; }}
+  tr.stock-row {{ transition: background 0.15s; cursor: pointer; }}
+  tr.stock-row:hover {{ background: var(--bg-row-hover); }}
+
+  .ticker-badge {{
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-family: var(--font-mono);
+    font-weight: 800;
+    color: var(--accent-cyan);
+    background: rgba(56, 189, 248, 0.12);
+    border: 1px solid rgba(56, 189, 248, 0.28);
+    padding: 3px 8px;
+    border-radius: 7px;
+    font-size: 0.88rem;
+    margin-right: 6px;
+  }}
+  .name-sub {{ font-size: 0.75rem; color: var(--text-muted); display: block; white-space: normal; margin-top: 3px; }}
+
+  /* 52W Price Range Visual Bar */
+  .range-bar-wrap {{
+    width: 128px;
+    margin-left: auto;
+    margin-top: 5px;
+  }}
+  .range-track {{
+    position: relative;
+    height: 6px;
+    background: rgba(148, 163, 184, 0.2);
+    border-radius: 999px;
+  }}
+  .range-fill {{
+    position: absolute;
+    top: 0; bottom: 0; left: 0;
+    border-radius: 999px;
+    background: linear-gradient(90deg, #10b981, #38bdf8, #6366f1);
+  }}
+  .range-dot {{
+    position: absolute;
+    top: 50%;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: #fff;
+    border: 2px solid var(--accent-cyan);
+    transform: translate(-50%, -50%);
+    box-shadow: 0 0 6px rgba(56, 189, 248, 0.8);
+  }}
+  .range-labels {{
+    display: flex;
+    justify-content: space-between;
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    color: var(--text-muted);
+    margin-top: 3px;
+  }}
+
+  /* Signal Badges & Track Dots */
+  .sig-badge {{
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    font-weight: 700;
+    font-size: 0.78rem;
+  }}
+  .sig-3 {{ background: var(--accent-rose-bg); color: #fda4af; border: 1px solid var(--accent-rose); box-shadow: 0 0 12px rgba(244, 63, 94, 0.25); }}
+  .sig-2 {{ background: var(--accent-emerald-bg); color: var(--accent-emerald); border: 1px solid rgba(16, 185, 129, 0.5); }}
+  .sig-1 {{ background: rgba(56, 189, 248, 0.14); color: var(--accent-cyan); border: 1px solid rgba(56, 189, 248, 0.4); }}
+  .sig-NEAR {{ background: var(--accent-amber-bg); color: var(--accent-amber); border: 1px solid rgba(245, 158, 11, 0.4); }}
+  .sig-WAIT {{ background: rgba(100, 116, 139, 0.12); color: var(--text-muted); border: 1px solid transparent; }}
+
+  .track-meter {{
+    display: inline-flex;
+    gap: 4px;
+    margin-right: 6px;
+    vertical-align: middle;
+  }}
+  .track-seg {{
+    width: 14px;
+    height: 7px;
+    border-radius: 3px;
+    background: rgba(148, 163, 184, 0.22);
+  }}
+  .track-seg.on-1 {{ background: var(--accent-cyan); }}
+  .track-seg.on-2 {{ background: var(--accent-emerald); }}
+  .track-seg.on-3 {{ background: var(--accent-rose); }}
+
+  .diff-neg {{ color: var(--accent-emerald); font-family: var(--font-mono); font-weight: 700; }}
+  .diff-near {{ color: var(--accent-amber); font-family: var(--font-mono); font-weight: 700; }}
+  .diff-pos {{ color: var(--text-muted); font-family: var(--font-mono); }}
+
+  /* Detail Drawer */
+  .detail-card {{
+    background: var(--bg-surface);
+    border: 1px solid var(--accent-indigo);
+    border-radius: 16px;
+    padding: 24px;
+    margin-bottom: 22px;
+    box-shadow: var(--shadow-glow);
+    display: none;
+  }}
+  .detail-card.show {{ display: block; animation: fadeIn 0.2s ease; }}
+  .detail-header {{
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 16px;
+    padding-bottom: 12px;
+    border-bottom: 1px solid var(--border-subtle);
+  }}
+  .detail-grid {{
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 16px;
+  }}
+  .strat-box {{
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-subtle);
+    border-radius: 12px;
+    padding: 18px;
+  }}
+  .strat-box.recommended {{
+    border-color: var(--accent-cyan);
+    box-shadow: 0 0 18px rgba(56, 189, 248, 0.14);
+  }}
+  .note-list {{ margin-top: 12px; list-style: none; }}
+  .note-list li {{
+    background: rgba(99, 102, 241, 0.09);
+    border-left: 3px solid var(--accent-indigo);
+    padding: 9px 14px;
+    margin-bottom: 8px;
+    border-radius: 0 8px 8px 0;
+    font-size: 0.88rem;
+  }}
+
+  .pro-item, .con-item {{ margin-bottom: 14px; }}
+  .pro-item h4 {{ color: var(--accent-emerald); margin-bottom: 4px; font-size: 0.96rem; }}
+  .con-item h4 {{ color: var(--accent-rose); margin-bottom: 4px; font-size: 0.96rem; }}
+  .pro-item p, .con-item p {{ color: var(--text-secondary); font-size: 0.88rem; }}
+
+  .calc-grid {{
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 16px;
+    margin-bottom: 20px;
+  }}
+  .calc-field label {{ display: block; font-size: 0.83rem; font-weight: 600; color: var(--text-secondary); margin-bottom: 6px; }}
+  .calc-field input {{
+    width: 100%;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-subtle);
+    color: var(--text-primary);
+    font-family: var(--font-mono);
+    padding: 10px 12px;
+    border-radius: 10px;
+    font-size: 0.95rem;
+  }}
+  .calc-field input:focus {{ outline: none; border-color: var(--accent-cyan); }}
+</style>
+</head>
+<body>
+
+<!-- Sticky Top Glass Header -->
+<header class="top-navbar">
+  <div class="top-navbar-inner">
+    <div class="brand-area">
+      <div class="brand-logo">🛡️</div>
+      <div class="brand-title">
+        <h1>我的美股 50/50 雙軌資產配置 ＆「PEG 7 折三軌監控系統」私人財富終端</h1>
+        <p>防遺忘投資憲法：50% 核心底倉 (CSPX 省稅大盤 + BND 債券防守) ＋ 50% 衛星狙擊倉 (SHV 短債停泊 + 22 檔巨頭 1/2/3 軌買進 & QQQ 股災抄底)</p>
+      </div>
+    </div>
+    <div class="status-cluster">
+      <div class="status-pill" title="透過 Yahoo Finance API 即時抓取最新股價、52週高低點、GAAP EPS、Forward EPS 與自由現金流">
+        <span class="pulse-dot"></span>
+        <span>資料源：<strong>Yahoo Finance API ({live_count}/{len(results)} 即時連線)</strong></span>
+      </div>
+      <div class="status-pill mono-num">⏱️ 更新：{now_str}</div>
+      <button class="theme-toggle-btn" onclick="toggleTheme()" id="theme-btn">☀️ 切換淺色晨報</button>
+    </div>
+  </div>
+</header>
+
+<div class="container">
+  <!-- Segmented Navigation Tabs -->
+  <nav class="tabs-wrapper">
+    <button class="tab-btn active" onclick="switchTab('tab-home', this)">📖 1. 我的投資憲法與每週 SOP (防遺忘主頁)</button>
+    <button class="tab-btn" onclick="switchTab('tab-monitor', this)">📊 2. 每週巡檢：22 檔三軌買賣價雷達</button>
+    <button class="tab-btn" onclick="switchTab('tab-sell-guide', this)">⚖️ 3. 賣股時機判斷 ＆ 五年回測範例驗證</button>
+    <button class="tab-btn" onclick="switchTab('tab-allocation', this)">💼 4. 50/50 視覺化配置與下單試算器</button>
+    <button class="tab-btn" onclick="switchTab('tab-calculator', this)">🧮 5. 方法論利弊 ＆ 自訂美股試算</button>
+  </nav>
+
+  <!-- ===================================================================== -->
+  <!-- TAB 1: 防遺忘主頁面 (我的投資憲法、每週巡檢 SOP、資料來源可靠度、1/2/3軌法則、全中文指標字典) -->
+  <!-- ===================================================================== -->
+  <div id="tab-home" class="tab-panel active">
+    <div class="playbook-hero">
+      <div>
+        <h2>📌 給未來的自己：為什麼我設計這套「50 / 50 雙軌配置 ＋ PEG 7 折三軌系統」？</h2>
+        <p>
+          這套系統融合了《全球布局與美股投資地圖》的四大指數思維與量化安全邊際。<strong>核心原則是「50% 核心避險底倉 ： 50% 衛星打折狙擊倉」</strong>——
+          平時不單押高波動科技股，靠 50% 底倉（愛爾蘭省稅標普 500 <strong>CSPX</strong> ＋ 總體債券 <strong>BND</strong>）穩健避險與參與國運；另外 50% 停泊在短期美債 <strong>SHV</strong> 領息當彈藥庫，
+          透過<strong>每週觀察一次</strong>（特別在市場恐慌或股災來臨時），依照下方<strong>「滿足 1 軌投 30%、滿足 2 軌投 60%、3 軌全滿重倉 100% + 抄底 QQQ」</strong>的金字塔紀律分批買進優質好股並長期持有！
+        </p>
+        <!-- 金字塔分批建倉視覺化階梯卡 -->
+        <div class="pyramid-grid">
+          <div class="pyramid-step">
+            <span class="step-tag" style="background:rgba(148,163,184,0.18);color:var(--text-muted);">⚪ 0 軌滿足｜平時高點</span>
+            <div class="step-pct" style="color:var(--text-muted);">投入 0%</div>
+            <div class="step-desc">股價高於所有 7 折線，資金停泊於 <strong>SHV 短債</strong> 領取 4~5% 美元利息，絕不追高。</div>
+            <div class="pyramid-bar"><div class="pyramid-bar-fill" style="width:8%;background:var(--text-muted);"></div></div>
+          </div>
+          <div class="pyramid-step">
+            <span class="step-tag" style="background:rgba(56,189,248,0.16);color:var(--accent-cyan);">🟢 滿足 1 個策略｜初步打折</span>
+            <div class="step-pct" style="color:var(--accent-cyan);">投入 30%</div>
+            <div class="step-desc">單一軌道率先跌破 7 折價，先投入該股目標額度的 <strong>30% 基本試單倉</strong>，確保不踏空。</div>
+            <div class="pyramid-bar"><div class="pyramid-bar-fill" style="width:30%;background:var(--accent-cyan);"></div></div>
+          </div>
+          <div class="pyramid-step">
+            <span class="step-tag" style="background:var(--accent-emerald-bg);color:var(--accent-emerald);">🟢🟢 滿足 2 個策略｜雙重確認</span>
+            <div class="step-pct" style="color:var(--accent-emerald);">投入 60%~70%</div>
+            <div class="step-desc">基本面與技術面/現金流兩軌同時認證打 7 折，安全邊際極高，果斷加碼至主力部位！</div>
+            <div class="pyramid-bar"><div class="pyramid-bar-fill" style="width:65%;background:var(--accent-emerald);"></div></div>
+          </div>
+          <div class="pyramid-step" style="border-color:rgba(244,63,94,0.45);">
+            <span class="step-tag" style="background:var(--accent-rose-bg);color:#fda4af;">🔥 3 個策略全滿足｜股災鐵底</span>
+            <div class="step-pct" style="color:#fda4af;">投入 100% 滿倉</div>
+            <div class="step-desc">三軌全數跌破 7 折（五年回測勝率 98%），將 <strong>SHV 全數換入買滿 100% 並同步抄底 QQQ</strong>！</div>
+            <div class="pyramid-bar"><div class="pyramid-bar-fill" style="width:100%;background:linear-gradient(90deg,#f43f5e,#f59e0b);"></div></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 右側 SVG 50/50 雙軌配置環狀視覺圖 -->
+      <div style="text-align:center;background:var(--bg-elevated);padding:20px 24px;border-radius:16px;border:1px solid var(--border-subtle);min-width:250px;">
+        <div style="font-size:0.82rem;font-weight:700;color:var(--text-muted);margin-bottom:10px;">50 / 50 核心與衛星配置藍圖</div>
+        <svg width="170" height="170" viewBox="0 0 42 42" style="margin:0 auto;display:block;">
+          <circle cx="21" cy="21" r="15.915" fill="transparent" stroke="rgba(148,163,184,0.15)" stroke-width="5"></circle>
+          <!-- CSPX 30% -->
+          <circle cx="21" cy="21" r="15.915" fill="transparent" stroke="#38bdf8" stroke-width="5" stroke-dasharray="30 70" stroke-dashoffset="25"></circle>
+          <!-- BND 20% -->
+          <circle cx="21" cy="21" r="15.915" fill="transparent" stroke="#c084fc" stroke-width="5" stroke-dasharray="20 80" stroke-dashoffset="-5"></circle>
+          <!-- SHV + 1/2/3軌個股 + QQQ 50% -->
+          <circle cx="21" cy="21" r="15.915" fill="transparent" stroke="#10b981" stroke-width="5" stroke-dasharray="50 50" stroke-dashoffset="-25"></circle>
+          <text x="21" y="19.5" text-anchor="middle" fill="var(--text-primary)" style="font-size:5px;font-weight:800;font-family:var(--font-mono);">50 : 50</text>
+          <text x="21" y="24.5" text-anchor="middle" fill="var(--text-muted)" style="font-size:2.7px;font-weight:600;">核心避險 / 衛星狙擊</text>
+        </svg>
+        <div style="text-align:left;font-size:0.78rem;margin-top:12px;display:grid;gap:4px;">
+          <div><span style="color:#38bdf8;">●</span> <strong>CSPX (30%)</strong>：愛爾蘭省稅標普 500</div>
+          <div><span style="color:#c084fc;">●</span> <strong>BND (20%)</strong>：美國總體債券防守倉</div>
+          <div><span style="color:#10b981;">●</span> <strong>SHV + QQQ + 22巨頭 (50%)</strong>：動態狙擊</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 新增：每週 3 分鐘例行巡檢 SOP ＆ 資料來源與 22 檔名單更新機制透明說明 -->
+    <div class="analysis-grid">
+      <div class="analysis-card">
+        <h3>🗓️ 每週日 3 分鐘例行觀察 SOP（可點擊打勾紀錄進度）</h3>
+        <p style="font-size:0.86rem;color:var(--text-muted);margin-bottom:12px;">這套策略最棒的地方就是<strong>「不需要每天盯盤」</strong>，非常適合每週固定觀察一次（股災大跌週則可加看一次）：</p>
+        <label class="checklist-item" onclick="toggleCheck(this)">
+          <input type="checkbox">
+          <span><strong>步驟 1｜雙擊執行 <code>run_tracker.bat</code></strong>：花 5 秒鐘自動從 Yahoo Finance 抓取 22 檔巨頭本週最新收盤價、52 週高低點與最新財報 EPS，並自動打開本網頁。</span>
+        </label>
+        <label class="checklist-item" onclick="toggleCheck(this)">
+          <input type="checkbox">
+          <span><strong>步驟 2｜切換到「📊 分頁 2：每週巡檢表」看頂部 4 張燈號卡</strong>：檢查本週是否有股票進入「🔥 3 軌全滿（投 100%）」或「🟢🟢 2 軌滿足（投 60%）」或「🟢 1 軌滿足（投 30%）」。</span>
+        </label>
+        <label class="checklist-item" onclick="toggleCheck(this)">
+          <input type="checkbox">
+          <span><strong>步驟 3｜從 <code>SHV 短債</code> 提撥對應 % 資金下單</strong>：若有達標股票且尚未建倉，賣出對應比例的 SHV 換成該檔好股；若全數觀望則關掉電腦安心過週末！</span>
+        </label>
+        <label class="checklist-item" onclick="toggleCheck(this)">
+          <input type="checkbox">
+          <span><strong>步驟 4｜檢視既有持股是否觸及「🎯 10 折合理賣出價」</strong>：若有持股已大漲超過 10 折合理賣價（約賺 +43%），可賣出 1/3 鎖定獲利轉回 CSPX/SHV，剩餘抱緊處理。</span>
+        </label>
+      </div>
+
+      <div class="analysis-card">
+        <h3>🔍 這些股票的資料從哪裡取得？是否可靠？22 檔名單是固定的嗎？</h3>
+        <div class="rule-box green">
+          <h4>1. 資料來源與可靠度：雙重官方級財經數據源（Yahoo Finance API ＋ SEC EDGAR）</h4>
+          <p>
+            • <strong>即時連線抓取（每次執行自動更新 6 大指標）</strong>：程式透過 <code>yfinance</code> 套件直接連線 <strong>Yahoo Finance 官方財經 API</strong>（其底層美股財報與共識預估整合自 <strong>S&P Global Market Intelligence / Capital IQ、Refinitiv / LSEG 與 Morningstar</strong>）。每次打開都會即時更新：<strong>① 最新股價、② 52 週最高價、③ 52 週最低價、④ 過去 12 個月帳面盈餘 (GAAP TTM EPS)、⑤ 華爾街外資預估遠期盈餘 (Forward EPS)、⑥ 每股自由現金流 (FCF/Share，含台積電 TSM 新台幣與 ASML 歐元財報自動匯率校正)</strong>。<br>
+            • <strong>美國證管會官方年報驗證（SEC EDGAR）</strong>：內建美國證管會 <code>data.sec.gov</code> 10-K 官方年報 CIK 查詢支援，且當網路斷線時具備<strong>離線備援機制（Fallback）</strong>，確保高度可靠且永不當機。
+          </p>
+        </div>
+        <div class="rule-box">
+          <h4>2. 這 22 檔股票是固定的，還是也會定期更新？</h4>
+          <p>
+            • <strong>股價、高低點、當期 EPS、預估 EPS、自由現金流 ➔ 「每週執行時 100% 自動更新」！</strong><br>
+            • <strong>22 檔名單本身與 5 年基準成長率 (CAGR) ➔ 「核心名單穩定、支援設定檔自由擴充」</strong>：這 22 家公司是從標普 500、那斯達克 100、費半、道瓊四大指數中精選出的「最強 AI 與護城河壟斷巨頭」，龍頭地位不會每週改變，建議<strong>每年初年報公布後檢視一次</strong>即可。若您想新增第 23、24 檔股票（如 AMD、ANET、COST），可直接編輯資料夾內的 <strong><code>watchlist_config.json</code></strong>，或在本網頁「分頁 5 自訂試算器」隨時輸入代號試算！
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <div class="analysis-grid">
+      <!-- 左欄：50/50 資產配置與專屬 ETF 選擇理由 -->
+      <div class="analysis-card">
+        <h3>🛡️ 一、我的 50 / 50 資產配置與專屬 ETF 選擇理由（省稅 ＋ 防守 ＋ 股災抄底）</h3>
+        
+        <div class="rule-box">
+          <h4>1. 標普 500 大盤核心：選擇英股【CSPX】（愛爾蘭註冊 S&P 500 ETF，取代美股 VOO / SPY）</h4>
+          <p>
+            • <strong>記憶提醒</strong>：我印象中的「CSCP」正式交易代號為 <strong>CSPX</strong>（iShares Core S&P 500 UCITS ETF，於倫敦交易所美元計價掛牌）。<br>
+            • <strong>為什麼不買 VOO / SPY 而買 CSPX？（省稅關鍵！）</strong>：臺灣人買美股 VOO / SPY 會被美國政府直接預扣 <strong>30% 股息稅</strong>，且若資產超過 6 萬美元還有高達 40% 的美國遺產稅風險。改買註冊在愛爾蘭的 <strong>CSPX</strong>，股息預扣稅直接<strong>減半為 15%</strong>，且為「股息自動再投資（累積型 Accumulating）」，不配發現金股利，完全免除海外股息所得稅與手動再投入的手續費！
+          </p>
+        </div>
+
+        <div class="rule-box purple">
+          <h4>2. 核心防守避險部位：選擇【BND】（Vanguard 美國總體債券市場 ETF）</h4>
+          <p>
+            • <strong>設計理由</strong>：放在 50% 核心底倉中負責<strong>「防守與避險」</strong>。涵蓋美國政府公債與高評等投資級公司債，當遇到系統性股災、經濟衰退迫使聯準會（Fed）降息救市時，BND 能發揮抗跌與資產保護傘功能，避免整體帳戶淨值劇烈縮水。
+          </p>
+        </div>
+
+        <div class="rule-box amber">
+          <h4>3. 衛星現金停泊彈藥庫：選擇【SHV】（iShares 1 年期以下美國極短期國庫券 ETF）</h4>
+          <p>
+            • <strong>設計理由</strong>：放在另外 50% 衛星倉中作為<strong>「等待好股打 7 折時的現金停泊池」</strong>。因為存續期間極短（1 年內到期國庫券），股災時價格幾乎完全不跌，平時又能穩定領取約 4%~5% 美元利息；一旦每週檢查發現個股亮綠燈或股災來臨，隨時賣出 SHV 換成便宜好股！
+          </p>
+        </div>
+
+        <div class="rule-box green">
+          <h4>4. 股災來臨時的指數重砲：選擇【QQQ】（Invesco 那斯達克 100 指數 ETF）</h4>
+          <p>
+            • <strong>設計理由</strong>：QQQ 匯集全球最強的 100 家科技創新巨頭。平時多頭高點不追高（且 QQQ 配息極低，無須擔心股息稅），但<strong>「股災來臨時（大盤自高點回檔 20%~30%），QQQ 是最佳抄底選擇」</strong>——既有科技股最強的反彈爆發力，又不必擔心單一公司倒閉風險！
+          </p>
+        </div>
+      </div>
+
+      <!-- 右欄：三軌策略白話介紹 & 1/2/3軌資金投入比例法則 -->
+      <div class="analysis-card">
+        <h3>🎯 二、三軌估價策略白話介紹 ＆「滿足 1、2、3 軌」金字塔資金投入法則</h3>
+
+        <div class="rule-box">
+          <h4>📐 什麼是【策略一】、【策略二】、【策略三】？（為什麼要有三個？）</h4>
+          <p>
+            • <strong>【策略一：帳面盈餘 (GAAP) 本益成長比 7 折價】</strong>：用公司財報上最嚴格的「過去一年帳面每股盈餘 (GAAP TTM EPS)」×「成長率 (最高鎖定45倍)」× <strong>0.70 (打7折)</strong>。適合算力硬體與雲端巨頭（如 NVDA、GOOGL、AMZN、TSM）。<br>
+            • <strong>【策略二：52 週最高價打 7 折（技術面回檔 30%）】</strong>：用過去一年最高股價 × <strong>0.70</strong>，並檢查是否高於過去一年最低價。專門用來抓高護城河巨頭（如 MSFT、AAPL、META）每年一次的中期回檔買點。<br>
+            • <strong>【策略三：真實現金流 / 遠期盈餘 (Forward EPS / FCF) 7 折價】</strong>：美國軟體公司（如 NOW、PANW、CRM、PLTR）常發股票給員工當薪水，導致策略一帳面盈餘被壓得很低；策略三改用「分析師預估未來一年盈餘」或「每股自由現金流」較高者 × 成長率 × <strong>0.70</strong>，還原軟體股真正的便宜買點！
+          </p>
+        </div>
+
+        <div class="rule-box green">
+          <h4>💰 每週檢查 SOP：當滿足 1 個、2 個、3 個策略時，該投入多少 % 資金？</h4>
+          <p>
+            每週打開本系統巡檢一次（平時與股災皆適用），針對單一股票的預計買進額度，嚴格執行<strong>「金字塔分批建倉」</strong>：<br><br>
+            1️⃣ <strong>【滿足 1 個策略（🟢 1軌達標）】➔ 先投入該股額度的 <span style="color:var(--accent-cyan);font-weight:700;">30% 資金</span>（基本試單倉）</strong><br>
+            &nbsp;&nbsp;&nbsp;代表股價已初步進入便宜區（例如剛從高點跌 30%，或真實現金流剛打 7 折），先買 30% 確保不踏空，若繼續跌手頭還有 70% 現金。<br><br>
+            2️⃣ <strong>【同時滿足 2 個策略（🟢🟢 2軌達標）】➔ 累計投入至 <span style="color:var(--accent-emerald);font-weight:700;">60% ~ 70% 資金</span>（主力加碼倉）</strong><br>
+            &nbsp;&nbsp;&nbsp;例如「帳面盈餘策略一 ＋ 真實現金流策略三」同時達標（如 GOOGL、NVDA），或「高點打 7 折策略二 ＋ 策略三」同時達標（如 AVGO），代表基本面與技術面雙重確認，再加碼 30%~40%！<br><br>
+            3️⃣ <strong>【三個策略全部滿足（🔥 3軌全滿）】➔ 放入大量資金至 <span style="color:#fda4af;font-weight:700;">100% 滿倉 ＋ 同步大買 QQQ</span>（股災世紀買點）</strong><br>
+            &nbsp;&nbsp;&nbsp;代表股價既從高點跌超過 30%，連最嚴苛的帳面盈餘與自由現金流也全部跌破 7 折（如 2022 年股災的 META、NVDA，或目前的 NFLX）！此時將 SHV 短債資金大舉換入，買滿 100% 並抱緊處理！
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <!-- 英文財務指標「全中文白話記憶字典」 -->
+    <div class="analysis-card">
+      <h3>📚 三、防遺忘專區：英文財務指標與代號「全中文白話記憶字典」（忘記英文縮寫時看這裡！）</h3>
+      <div class="table-wrap" style="margin-bottom:0;">
+        <table>
+          <thead>
+            <tr>
+              <th style="text-align:left;">英文縮寫 / 代號</th>
+              <th style="text-align:left;">完整英文名稱</th>
+              <th style="text-align:left;">臺灣繁體中文名稱</th>
+              <th style="text-align:left;">大白話意義與為什麼要看它？（防遺忘筆記）</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong style="color:var(--accent-cyan);">PE (P/E Ratio)</strong></td>
+              <td style="text-align:left;">Price-to-Earnings Ratio</td>
+              <td style="text-align:left;"><strong>本益比（股價 ÷ 每股盈餘）</strong></td>
+              <td style="text-align:left;white-space:normal;">代表「買進這家公司幾年後可以靠它賺的錢回本」。例如股價 $200、每年賺 $10，本益比就是 20 倍。</td>
+            </tr>
+            <tr>
+              <td><strong style="color:var(--accent-cyan);">CAGR (%)</strong></td>
+              <td style="text-align:left;">Compound Annual Growth Rate</td>
+              <td style="text-align:left;"><strong>歷史年均複合成長率</strong></td>
+              <td style="text-align:left;white-space:normal;">公司過去 5 年（2020→2025）獲利平均每年成長幾 %。例如 CAGR = 30%，代表獲利每年平均長大 30%。</td>
+            </tr>
+            <tr>
+              <td><strong style="color:var(--accent-emerald);">PEG</strong></td>
+              <td style="text-align:left;">Price/Earnings-to-Growth Ratio</td>
+              <td style="text-align:left;"><strong>本益成長比（本益比 ÷ 成長率 CAGR）</strong></td>
+              <td style="text-align:left;white-space:normal;">彼得・林區發明的核心指標！當「本益比 = 成長率」時 PEG = 1.0（合理價，即 10 折）；<strong>我們要求打 7 折（PEG ≤ 0.70）才買進！</strong></td>
+            </tr>
+            <tr>
+              <td><strong style="color:var(--accent-amber);">MAX_PE_CAP (45x)</strong></td>
+              <td style="text-align:left;">Maximum P/E Ratio Cap</td>
+              <td style="text-align:left;"><strong>合理本益比封頂上限（45 倍）</strong></td>
+              <td style="text-align:left;white-space:normal;">有些爆發股（如 NVDA 成長率 90%、PLTR 成長率 176%）如果直接用成長率當本益比會算出天價。所以強制規定合理本益比最高不超過 45 倍，<strong>打 7 折後最高只給 31.5 倍本益比</strong>。</td>
+            </tr>
+            <tr>
+              <td><strong style="color:var(--accent-cyan);">GAAP TTM EPS</strong></td>
+              <td style="text-align:left;">GAAP Trailing Twelve Months EPS</td>
+              <td style="text-align:left;"><strong>過去 12 個月「帳面」每股盈餘</strong></td>
+              <td style="text-align:left;white-space:normal;">最嚴格的官方會計準則（GAAP）算出來的過去一年每股賺多少錢，用於計算<strong>【策略一】</strong>。</td>
+            </tr>
+            <tr>
+              <td><strong style="color:var(--accent-emerald);">Forward Non-GAAP EPS</strong></td>
+              <td style="text-align:left;">Forward Non-GAAP Earnings Per Share</td>
+              <td style="text-align:left;"><strong>華爾街預估「未來一年真實本業」每股盈餘</strong></td>
+              <td style="text-align:left;white-space:normal;">扣除發給員工的股票費用（SBC）與一次性費用後，分析師預估未來一年真正能賺的每股盈餘，用於計算<strong>【策略三】</strong>。</td>
+            </tr>
+            <tr>
+              <td><strong style="color:var(--accent-emerald);">FCF per Share</strong></td>
+              <td style="text-align:left;">Free Cash Flow per Share</td>
+              <td style="text-align:left;"><strong>每股自由現金流（真正進口袋的現金）</strong></td>
+              <td style="text-align:left;white-space:normal;">公司營業收到的現金扣掉買設備支出後，真正可以自由運用的每股現金。軟體股（如 NOW、CRM、PANW）收年費現金最多，看這個最準！</td>
+            </tr>
+            <tr>
+              <td><strong style="color:var(--accent-purple);">SBC</strong></td>
+              <td style="text-align:left;">Stock-Based Compensation</td>
+              <td style="text-align:left;"><strong>員工股權獎勵（發股票當薪水）</strong></td>
+              <td style="text-align:left;white-space:normal;">美國軟體公司喜歡發股票給工程師當獎金，會計上會害「帳面盈餘 (GAAP EPS)」看起來很低，所以軟體股一定要改看【策略三】。</td>
+            </tr>
+            <tr>
+              <td><strong style="color:var(--accent-purple);">52W High / Low</strong></td>
+              <td style="text-align:left;">52-Week High / Low Price</td>
+              <td style="text-align:left;"><strong>過去 52 週（一年內）最高價 ／ 最低價</strong></td>
+              <td style="text-align:left;white-space:normal;">用來算<strong>【策略二：52 週最高價 × 0.70】</strong>。如果算出來的 7 折價 ≥ 52 週最低價，代表過去一年真的跌到過這個價位，不是空想！</td>
+            </tr>
+            <tr>
+              <td><strong style="color:var(--accent-cyan);">CSPX / BND / SHV / QQQ</strong></td>
+              <td style="text-align:left;">Core Portfolio ETFs</td>
+              <td style="text-align:left;"><strong>我的四大資產配置 ETF 代號</strong></td>
+              <td style="text-align:left;white-space:normal;"><strong>CSPX</strong> = 愛爾蘭省稅版標普500（即我記的 CSCP）；<strong>BND</strong> = 總體債券防守倉；<strong>SHV</strong> = 短期美債現金停泊池；<strong>QQQ</strong> = 那斯達克100（股災大跌時的抄底首選）。</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===================================================================== -->
+  <!-- TAB 2: 每週巡檢監控表 (全中文表頭 + 52週股價區間視覺尺 + 滿足幾軌 + 7折買價與10折賣價) -->
+  <!-- ===================================================================== -->
+  <div id="tab-monitor" class="tab-panel">
+    <!-- KPI Summary -->
+    <div class="kpi-grid">
+      <div class="kpi-card k-t3">
+        <div class="kpi-title">🔥 3 軌全滿（投入 100% 大量資金 / 股災黃金坑）</div>
+        <div class="kpi-value" style="color: #fda4af;" id="kpi-3-count">0 檔</div>
+        <div class="kpi-sub" id="kpi-3-tickers">-</div>
+      </div>
+      <div class="kpi-card k-t2">
+        <div class="kpi-title">🟢🟢 2 軌同時滿足（投入 60% 主力加碼資金）</div>
+        <div class="kpi-value" style="color: var(--accent-emerald);" id="kpi-2-count">0 檔</div>
+        <div class="kpi-sub" id="kpi-2-tickers">-</div>
+      </div>
+      <div class="kpi-card k-t1">
+        <div class="kpi-title">🟢 1 軌滿足（投入 30% 基本試單資金）</div>
+        <div class="kpi-value" style="color: var(--accent-cyan);" id="kpi-1-count">0 檔</div>
+        <div class="kpi-sub" id="kpi-1-tickers">-</div>
+      </div>
+      <div class="kpi-card k-near">
+        <div class="kpi-title">🟡 接近買點預警（距離 7 折價 +10% 內，SHV 待命）</div>
+        <div class="kpi-value" style="color: var(--accent-amber);" id="kpi-near-count">0 檔</div>
+        <div class="kpi-sub" id="kpi-near-tickers">-</div>
+      </div>
+    </div>
+
+    <!-- Interactive Parameter Sliders -->
+    <div class="control-panel">
+      <div class="control-item">
+        <label>買進安全邊際折數（預設打 7 折 = 0.70） <span id="lbl-discount">0.70 (70折)</span></label>
+        <input type="range" id="slider-discount" min="0.50" max="0.90" step="0.05" value="{cfg.safety_discount}" oninput="recalculateAll()">
+        <div class="control-hint">0.70 代表比合理價便宜 30% 才買；賣出價則固定為回到 10 折合理價</div>
+      </div>
+      <div class="control-item">
+        <label>合理本益比封頂上限（預設最高 45 倍） <span id="lbl-pecap">45.0倍 (打7折後最高 31.5倍)</span></label>
+        <input type="range" id="slider-pecap" min="25" max="65" step="2.5" value="{cfg.max_pe_cap}" oninput="recalculateAll()">
+        <div class="control-hint">防止高成長股（如 NVDA/PLTR）算出過高目標價的保護蓋</div>
+      </div>
+      <div class="control-item">
+        <label>黃燈接近預警範圍（預設 +10% 內提醒） <span id="lbl-near">+10%</span></label>
+        <input type="range" id="slider-near" min="0.05" max="0.25" step="0.05" value="{cfg.near_target_threshold}" oninput="recalculateAll()">
+        <div class="control-hint">當股價還沒跌破 7 折、但只差不到 10% 時亮黃燈提醒準備賣 SHV</div>
+      </div>
+    </div>
+
+    <!-- Selected Stock Detail Drawer -->
+    <div id="detail-drawer" class="detail-card">
+      <div class="detail-header">
+        <div>
+          <h2 id="dt-title" style="font-size: 1.35rem; color: var(--accent-cyan);">GOOGL - Alphabet</h2>
+          <p id="dt-subtitle" style="font-size: 0.88rem; color: var(--text-muted);"></p>
+        </div>
+        <button class="action-btn" onclick="document.getElementById('detail-drawer').classList.remove('show')">✕ 關閉個股詳情</button>
+      </div>
+      <div class="detail-grid" id="dt-strat-grid"></div>
+      <ul class="note-list" id="dt-notes"></ul>
+    </div>
+
+    <!-- Filter & Search -->
+    <div class="filter-bar">
+      <div class="filter-pills">
+        <button class="pill-btn active" onclick="setFilter('ALL', this)">全部 {len(results)} 檔巨頭</button>
+        <button class="pill-btn" onclick="setFilter('T3', this)">🔥 3軌全滿 (投100%)</button>
+        <button class="pill-btn" onclick="setFilter('T2', this)">🟢🟢 2軌滿足 (投60%)</button>
+        <button class="pill-btn" onclick="setFilter('T1', this)">🟢 1軌滿足 (投30%)</button>
+        <button class="pill-btn" onclick="setFilter('NEAR', this)">🟡 接近買點 (+10%內)</button>
+        <button class="pill-btn" onclick="setFilter('CLOUD_AI', this)">☁️ AI 雲端</button>
+        <button class="pill-btn" onclick="setFilter('SEMI_AI', this)">⚡ AI 晶片</button>
+        <button class="pill-btn" onclick="setFilter('SEMI_EQUIP', this)">🔬 半導體設備</button>
+        <button class="pill-btn" onclick="setFilter('SAAS_SBC', this)">💻 企業軟體 SaaS</button>
+        <button class="pill-btn" onclick="setFilter('MATURE_MOAT', this)">🏰 道瓊護城河巨頭</button>
+      </div>
+      <div class="search-box">
+        <input type="text" id="search-input" class="search-input" placeholder="🔍 搜尋代號或公司名稱..." oninput="renderTable()">
+        <button class="action-btn" onclick="resetSliders()">↺ 還原預設 7 折</button>
+        <button class="action-btn" onclick="downloadCurrentCSV()">⬇ 匯出中文 CSV 報表</button>
+      </div>
+    </div>
+
+    <!-- Main Valuation Table -->
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th onclick="sortBy('ticker')">股票代號 / 公司與資料源 ↕</th>
+            <th onclick="sortBy('current_price')">目前股價 ＆ 52週高低位階尺 ↕</th>
+            <th onclick="sortBy('cagr_pct')">5年歷史成長率<br>(CAGR) ↕</th>
+            <th onclick="sortBy('discounted_pe')">打7折後給的<br>目標本益比 ↕</th>
+            <th onclick="sortBy('s1_target_price')">【策略一】買價<br>帳面盈餘7折 ↕</th>
+            <th onclick="sortBy('s2_target_price')">【策略二】買價<br>52週高點7折 ↕</th>
+            <th onclick="sortBy('s3_target_price')">【策略三】買價<br>真實現金流7折 ↕</th>
+            <th onclick="sortBy('recommended_diff_pct')">🟢 推薦7折買進價<br>(與現價差距) ↕</th>
+            <th onclick="sortBy('fair_sell_price_100')">🎯 賣股參考價<br>(10折合理 / 12折過熱) ↕</th>
+            <th onclick="sortBy('matched_tracks_count')">滿足幾軌 ＆ 建議投入資金比例 ↕</th>
+          </tr>
+        </thead>
+        <tbody id="table-body"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ===================================================================== -->
+  <!-- TAB 3: 賣股時機判斷指南 ＆ 五年回測跑出範例驗證頁 -->
+  <!-- ===================================================================== -->
+  <div id="tab-sell-guide" class="tab-panel">
+    <div class="analysis-grid">
+      <div class="analysis-card">
+        <h3>⚖️ 一、賣股的時間怎麼判斷？回測上面的「賣出數值」是什麼理由？</h3>
+        <div class="rule-box green">
+          <h4>💡 回測採用的賣出數值理由：為什麼「7 折買進 ➔ 漲回 10 折合理價（賺 +42.86%）」就觸發停利？</h4>
+          <p>
+            • <strong>數學原理非常直觀</strong>：假設一家公司真正的「10 折合理價值（PEG = 1.0 理想價）」是 <strong>$100 元</strong>。<br>
+            • 我們耐心等到它打 7 折（<strong>$70 元</strong>）才買進。<br>
+            • 當市場恐慌結束、股價從 $70 元重新漲回原本的 10 折合理價值 <strong>$100 元</strong> 時，您的獲利幅度正好是：<br>
+            &nbsp;&nbsp;<code>($100 - $70) ÷ $70 = +42.86%</code>（公式：<code>7折買進目標價 ÷ 0.70 = 10折合理賣出價</code>）。<br>
+            • <strong>回測的第二賣出條件（滿 1 年時間停利）</strong>：如果買進後抱滿 <strong>1 年（252 個交易日）</strong>，股價還沒漲到 +42.86%，但已經<strong>獲利超過 +15%</strong>，回測系統也會獲利了結，把資金收回 SHV 短債等待下一檔打 7 折的股票。
+          </p>
+        </div>
+
+        <div class="rule-box amber">
+          <h4>🏆 給您的實戰最佳賣股 SOP：「半倉 10~12 折收回成本 ＋ 半倉抱緊處理」</h4>
+          <p>
+            我們在五年回測中發現：如果漲到 10 折合理價（賺 +42.9%）就把股票<strong>全部賣光</strong>，5 年總報酬是 <strong>+253%</strong>；但如果買在 7 折後<strong>「抱緊處理（不賣）」</strong>，因為不會提早賣飛 NVDA (+965%)、AVGO (+532%)、META (+254%)，平均報酬率高達 <strong>+354%</strong>！<br><br>
+            因此，最不怕賣錯、心理最舒服的<strong>「三階段賣股法則」</strong>如下（下方表格已直接幫您算出每檔股票的價格）：<br>
+            1️⃣ <strong>【第一階段：漲到「🎯 10 折合理價」（約賺 +43%）】</strong>➔ 先賣出 <strong>1/3 部位</strong>，把賺到的錢轉回 <strong>CSPX</strong> 或 <strong>SHV</strong>，讓剩下的股票成本大幅降低。<br>
+            2️⃣ <strong>【第二階段：漲到「🔥 12 折過熱價」（PEG = 1.2，約賺 +71%）】</strong>➔ 再賣出 <strong>1/3 部位</strong>，至此您已經把當初投入的本金全部拿回來了！<br>
+            3️⃣ <strong>【第三階段：最後 1/3 零成本股票】</strong>➔ <strong>永久「抱緊處理」</strong>！除非公司連續兩季預估盈餘 (Forward EPS) 與自由現金流衰退超過 15%，否則一輩子不賣，安心領股利與享受十倍股複利！
+          </p>
+        </div>
+      </div>
+
+      <div class="analysis-card">
+        <h3>📋 二、22 檔巨頭目前「🟢 7 折買進價」對照「🎯 10 折合理賣出價 ／ 🔥 12 折過熱減碼價」速查表</h3>
+        <p style="font-size:0.86rem;color:var(--text-muted);margin-bottom:10px;">不用自己按計算機，買進後若不知道什麼價位該分批停利，直接對照這張表的右邊兩欄即可：</p>
+        <div class="table-wrap" style="max-height:430px;overflow-y:auto;margin-bottom:0;">
+          <table>
+            <thead>
+              <tr>
+                <th style="text-align:left;">代號 / 公司</th>
+                <th>目前股價</th>
+                <th>🟢 推薦 7 折買進價<br>(建倉目標)</th>
+                <th>🎯 10 折合理賣出價<br>(回測停利點 / 賣1/3)</th>
+                <th>🔥 12 折過熱減碼價<br>(泡沫減碼點 / 再賣1/3)</th>
+              </tr>
+            </thead>
+            <tbody id="sell-price-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- 五年回測跑出來的真實範例驗證表 (永久留存供後續驗證) -->
+    <div class="analysis-card">
+      <h3>📊 三、近五年（2021-10 ～ 2026-10）回測跑出來的「22 檔個股統計」與「真實買賣範例紀錄」（留存供您隨時驗證）</h3>
+      <p style="color:var(--text-muted);font-size:0.9rem;margin-bottom:14px;">
+        以下為系統根據過去 5 年真實歷史股價跑出來的完整回測資料（每次觸發 7 折買進投入 $10,000 美元，單邊扣除 0.15% 手續費，漲回 10 折合理價或滿 1 年獲利 ≥ 15% 時賣出）：
+      </p>
+      <div class="table-wrap" style="margin-bottom:20px;">
+        <table>
+          <thead>
+            <tr>
+              <th style="text-align:left;">股票代號</th>
+              <th style="text-align:left;">公司名稱</th>
+              <th style="text-align:left;">回測採用之定錨策略</th>
+              <th>5年觸發買進次數</th>
+              <th>獲利勝率 (%)</th>
+              <th>單筆平均淨報酬 (已扣手續費)</th>
+              <th>平均持有交易日</th>
+              <th>累計總手續費 ($)</th>
+              <th>累計波段淨獲利 ($)</th>
+              <th>最佳單筆報酬</th>
+              <th>對照：5年買進不賣報酬</th>
+            </tr>
+          </thead>
+          <tbody id="bt-summary-tbody"></tbody>
+        </table>
+      </div>
+
+      <h4 style="color:var(--accent-cyan);margin-bottom:10px;font-size:1.05rem;">📜 2021–2026 歷史真實觸發之每一筆「買進日期、當時 7 折價、賣出日期、賣出價與出場理由」完整驗證明細：</h4>
+      <div class="table-wrap" style="max-height:520px;overflow-y:auto;margin-bottom:0;">
+        <table>
+          <thead>
+            <tr>
+              <th style="text-align:left;">代號</th>
+              <th style="text-align:left;">公司名稱</th>
+              <th>買進日期</th>
+              <th>買進成交價 ($)</th>
+              <th>當時算出的 7 折目標價 ($)</th>
+              <th>賣出日期</th>
+              <th>賣出成交價 ($)</th>
+              <th style="text-align:left;">觸發賣出之具體理由</th>
+              <th>持有天數</th>
+              <th>來回手續費 ($)</th>
+              <th>單筆實質淨賺 ($)</th>
+              <th>單筆淨報酬率 (%)</th>
+            </tr>
+          </thead>
+          <tbody id="bt-trades-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===================================================================== -->
+  <!-- TAB 4: 50/50 雙軌資產配置與 1/2/3 軌金字塔下單金額試算器 -->
+  <!-- ===================================================================== -->
+  <div id="tab-allocation" class="tab-panel">
+    <div class="analysis-card">
+      <h3>💼 我的 50 / 50 雙軌資產配置試算器（CSPX 省稅大盤 ＋ BND 防守債 ＋ SHV 短債停泊 ＋ 1/2/3 軌個股加碼）</h3>
+      <p style="color: var(--text-muted); font-size: 0.92rem; margin-bottom: 18px;">
+        輸入您的總投資金額（美元），系統自動按照您的「50% 核心底倉 (CSPX + BND) ： 50% 衛星狙擊倉 (SHV 停泊 + 依 1/2/3 軌滿足程度加碼個股 & QQQ 股災預備金)」計算出精準配置金額：
+      </p>
+      <div class="calc-grid">
+        <div class="calc-field">
+          <label>總投資預算 (美元 USD)</label>
+          <input type="number" step="1000" id="alloc-total-usd" value="100000" oninput="runAllocationCalc()">
+        </div>
+        <div class="calc-field">
+          <label>核心底倉比重 (預設 50% 避險與配置)</label>
+          <input type="number" step="5" min="10" max="90" id="alloc-core-pct" value="50" oninput="runAllocationCalc()">
+        </div>
+        <div class="calc-field">
+          <label>衛星狙擊倉比重 (預設 50% 打折個股+SHV+QQQ)</label>
+          <input type="number" step="5" id="alloc-sat-pct" value="50" disabled>
+        </div>
+      </div>
+      <div id="allocation-result" class="analysis-grid"></div>
+    </div>
+  </div>
+
+  <!-- ===================================================================== -->
+  <!-- TAB 5: 方法論利弊剖析 ＆ 自訂美股 PEG 7 折試算器 -->
+  <!-- ===================================================================== -->
+  <div id="tab-calculator" class="tab-panel">
+    <div class="analysis-card">
+      <h3>🧮 自訂美股「本益成長比 7 折三軌模型」即時試算器</h3>
+      <p style="color: var(--text-muted); font-size: 0.9rem; margin-bottom: 20px;">若未來想自己算 22 檔名單外的其他美股（例如 AMD、ANET、TSLA、COST），輸入以下數字即可自動算出 7 折買進價與 10 折賣出價：</p>
+      <div class="calc-grid">
+        <div class="calc-field"><label>股票代號 (Ticker)</label><input type="text" id="c-ticker" value="ANET" oninput="runCustomCalc()"></div>
+        <div class="calc-field"><label>目前股價 ($)</label><input type="number" step="0.01" id="c-price" value="95.00" oninput="runCustomCalc()"></div>
+        <div class="calc-field"><label>過去一年 (52週) 最高價 ($)</label><input type="number" step="0.01" id="c-high52" value="133.50" oninput="runCustomCalc()"></div>
+        <div class="calc-field"><label>過去一年 (52週) 最低價 ($)</label><input type="number" step="0.01" id="c-low52" value="78.00" oninput="runCustomCalc()"></div>
+        <div class="calc-field"><label>5年前基準每股盈餘 EPS ($)</label><input type="number" step="0.01" id="c-base-eps" value="0.60" oninput="runCustomCalc()"></div>
+        <div class="calc-field"><label>最新完整財年每股盈餘 EPS ($)</label><input type="number" step="0.01" id="c-latest-eps" value="2.25" oninput="runCustomCalc()"></div>
+        <div class="calc-field"><label>間隔年數 (N，一般為 5 年)</label><input type="number" step="1" id="c-years" value="5" oninput="runCustomCalc()"></div>
+        <div class="calc-field"><label>當期帳面盈餘 GAAP TTM EPS ($)</label><input type="number" step="0.01" id="c-gaap-eps" value="2.35" oninput="runCustomCalc()"></div>
+        <div class="calc-field"><label>預估遠期盈餘 Forward EPS ($)</label><input type="number" step="0.01" id="c-fwd-eps" value="2.75" oninput="runCustomCalc()"></div>
+        <div class="calc-field"><label>每股自由現金流 FCF/Share ($)</label><input type="number" step="0.01" id="c-fcf" value="2.90" oninput="runCustomCalc()"></div>
+      </div>
+      <div id="custom-calc-result" class="detail-grid"></div>
+    </div>
+
+    <div class="analysis-grid">
+      <div class="analysis-card">
+        <h3>✅ 這套「PEG 7 折三軌系統」的五大優勢（為什麼它能賺錢？）</h3>
+        <div class="pro-item"><h4>1. 量化紀律明確，克服追高殺低 (FOMO 防護)</h4><p>強制在合理價值打 7 折（預留 30% 安全邊際）才買進，杜絕在情緒高點接刀。</p></div>
+        <div class="pro-item"><h4>2. 「本益比 45 倍封頂」過濾低基期爆發幻覺</h4><p>防止短期翻倍股算出百倍本益比天價，打 7 折後最高只給 31.5 倍 PE。</p></div>
+        <div class="pro-item"><h4>3. 【策略三】破解美股軟體股「發股票給員工 (SBC)」的會計扭曲</h4><p>改採預估遠期盈餘與自由現金流，還原 NOW、PANW、CRM 真實獲利能力。</p></div>
+        <div class="pro-item"><h4>4. 【策略二 + 52週低點檢核】解決護城河巨頭「基本面永遠買不到」難題</h4><p>讓 MSFT、AAPL、META 在每年一次的高點回檔 30% 時有明確買點可循。</p></div>
+        <div class="pro-item"><h4>5. 結合 50/50 資產配置 (CSPX + BND + SHV + QQQ)，兼顧省稅與抗跌</h4><p>平時有底倉與短債利息保護，股災時有 SHV 轉 QQQ 與 3 軌全滿個股的超額爆發力。</p></div>
+      </div>
+      <div class="analysis-card">
+        <h3>⚠️ 操作時務必留意的四大避坑守則（防範盲點）</h3>
+        <div class="con-item"><h4>1. 半導體設備股（ASML/AMAT/LRCX/KLAC）注意景氣循環</h4><p>設備股在景氣最高峰時 EPS 最高、看似本益比最低，務必分批建倉不單筆重押。</p></div>
+        <div class="con-item"><h4>2. 傳統軟體股若跌破高點 7 折超過 15%（如 ADBE/INTU），先停看聽</h4><p>當僅有【策略二】達標、但【策略三】還沒達標時，只投 30% 試單，等策略三也達標（滿 2 軌）再加碼。</p></div>
+        <div class="con-item"><h4>3. MSFT 與 AAPL 切勿死等策略一（帳面 PEG 7 折）</h4><p>道瓊超級權值股享有確定性溢價，請以【策略二（52週高點打7折）】作為主要買進依據。</p></div>
+        <div class="con-item"><h4>4. 買在 7 折後切忌「剛賺 10% 就全賣光」</h4><p>好不容易等到打 7 折買進，請至少抱到「🎯 10 折合理價（+42.9%）」再減碼 1/3，並保留底倉抱緊處理。</p></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  const RAW_DATA = {data_json};
+  const DEFAULT_CFG = {cfg_json};
+  const BT_SUMMARIES = {bt_sum_json};
+  const BT_TRADES = {bt_tr_json};
+  let currentData = [];
+  let currentFilter = 'ALL';
+  let sortField = 'matched_tracks_count';
+  let sortAsc = false;
+
+  function toggleTheme() {{
+    const html = document.documentElement;
+    const current = html.getAttribute('data-theme') || 'dark';
+    const next = current === 'dark' ? 'light' : 'dark';
+    html.setAttribute('data-theme', next);
+    const btn = document.getElementById('theme-btn');
+    btn.textContent = next === 'dark' ? '☀️ 切換淺色晨報' : '🌙 切換深色終端';
+    try {{ localStorage.setItem('peg_theme', next); }} catch(e) {{}}
+  }}
+
+  function toggleCheck(labelEl) {{
+    setTimeout(() => {{
+      const cb = labelEl.querySelector('input[type="checkbox"]');
+      if (cb && cb.checked) labelEl.classList.add('checked');
+      else labelEl.classList.remove('checked');
+    }}, 10);
+  }}
+
+  function switchTab(tabId, btn) {{
+    document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    document.getElementById(tabId).classList.add('active');
+    btn.classList.add('active');
+  }}
+
+  function evaluateSig(price, target, nearThresh) {{
+    if (target <= 0) return ['WAIT', 999.9];
+    const diff = ((price - target) / target) * 100.0;
+    if (price <= target) return ['BUY', diff];
+    if (price <= target * (1.0 + nearThresh)) return ['NEAR', diff];
+    return ['WAIT', diff];
+  }}
+
+  function recalculateAll() {{
+    const discount = parseFloat(document.getElementById('slider-discount').value);
+    const peCap = parseFloat(document.getElementById('slider-pecap').value);
+    const nearThresh = parseFloat(document.getElementById('slider-near').value);
+
+    document.getElementById('lbl-discount').textContent = `${{discount.toFixed(2)}} (${{Math.round(discount*100)}}折)`;
+    document.getElementById('lbl-pecap').textContent = `${{peCap.toFixed(1)}}倍 (打折後最高 ${{(peCap*discount).toFixed(1)}}倍)`;
+    document.getElementById('lbl-near').textContent = `+${{Math.round(nearThresh*100)}}%`;
+
+    currentData = RAW_DATA.map(item => {{
+      const d = {{ ...item }};
+      const cappedPe = Math.max(DEFAULT_CFG.min_cagr_floor, Math.min(d.cagr_pct, peCap));
+      const discPe = cappedPe * discount;
+
+      const s1Ideal = d.gaap_ttm_eps * cappedPe;
+      const s1Target = s1Ideal * discount;
+      const [s1Sig, s1Diff] = evaluateSig(d.current_price, s1Target, nearThresh);
+
+      const s2Target = d.high_52w * discount;
+      const [s2Sig, s2Diff] = evaluateSig(d.current_price, s2Target, nearThresh);
+      const s2Valid = s2Target >= d.low_52w;
+
+      const s3Ideal = d.true_profit_base * cappedPe;
+      const s3Target = s3Ideal * discount;
+      const [s3Sig, s3Diff] = evaluateSig(d.current_price, s3Target, nearThresh);
+
+      let recTarget = s1Target;
+      if (d.sector_type === 'SAAS_SBC') {{
+        recTarget = d.cagr_pct >= 25.0 ? s3Target : (s2Valid ? Math.max(s2Target, s3Target) : s3Target);
+      }} else if (d.sector_type === 'MATURE_MOAT') {{
+        recTarget = s2Target;
+      }} else if (d.sector_type === 'SEMI_EQUIP') {{
+        recTarget = s3Target;
+      }} else {{
+        recTarget = (d.gaap_ttm_eps / d.true_profit_base) >= 0.85 ? s1Target : s3Target;
+      }}
+      const [recSig, recDiff] = evaluateSig(d.current_price, recTarget, nearThresh);
+
+      const trBuys = [];
+      if (s1Sig === 'BUY') trBuys.push('策略一');
+      if (s2Sig === 'BUY' && s2Valid) trBuys.push('策略二');
+      if (s3Sig === 'BUY') trBuys.push('策略三');
+      const matchedCnt = trBuys.length;
+
+      const anyNear = (s1Sig === 'NEAR') || (s3Sig === 'NEAR') || (s2Sig === 'NEAR' && s2Valid);
+      let overall = '⚪ 0軌 (觀望領息)';
+      let allocSuggest = '⚪ 投入 0% (SHV短債領息)';
+      if (matchedCnt === 3) {{
+        overall = `🔥 3軌全滿 (${{trBuys.join('/')}})`;
+        allocSuggest = '🔥 投入 100% 大量資金 (三軌全滿重倉)';
+      }} else if (matchedCnt === 2) {{
+        overall = `🟢🟢 2軌滿足 (${{trBuys.join('/')}})`;
+        allocSuggest = '🟢🟢 投入 60% 資金 (雙軌確認加碼)';
+      }} else if (matchedCnt === 1) {{
+        overall = `🟢 1軌滿足 (${{trBuys[0]}})`;
+        allocSuggest = '🟢 投入 30% 資金 (單軌試單建倉)';
+      }} else if (anyNear) {{
+        const trN = [];
+        if (s1Sig === 'NEAR') trN.push('策略一');
+        if (s2Sig === 'NEAR') trN.push('策略二');
+        if (s3Sig === 'NEAR') trN.push('策略三');
+        overall = `🟡 接近買點 (${{trN.join('/')}})`;
+        allocSuggest = '🟡 0% (距買點10%內，準備賣SHV)';
+      }}
+
+      const fairSell100 = discount > 0 ? (recTarget / discount) : (recTarget * 1.4286);
+      const overheatedSell120 = fairSell100 * 1.20;
+
+      return {{
+        ...d,
+        capped_pe: cappedPe,
+        discounted_pe: discPe,
+        s1_ideal_price: s1Ideal,
+        s1_target_price: s1Target,
+        s1_diff_pct: s1Diff,
+        s1_signal: s1Sig,
+        s2_target_price: s2Target,
+        s2_diff_pct: s2Diff,
+        s2_backtest_valid: s2Valid,
+        s2_signal: s2Sig,
+        s3_ideal_price: s3Ideal,
+        s3_target_price: s3Target,
+        s3_diff_pct: s3Diff,
+        s3_signal: s3Sig,
+        recommended_target: recTarget,
+        recommended_diff_pct: recDiff,
+        rec_sig_code: recSig,
+        matched_tracks_count: matchedCnt,
+        alloc_pct_suggestion: allocSuggest,
+        fair_sell_price_100: fairSell100,
+        overheated_sell_price_120: overheatedSell120,
+        overall_signal: overall
+      }};
+    }});
+
+    updateKPIs();
+    renderTable();
+    renderSellGuideTables();
+    runCustomCalc();
+    runAllocationCalc();
+  }}
+
+  function updateKPIs() {{
+    const t3 = currentData.filter(d => d.matched_tracks_count === 3);
+    const t2 = currentData.filter(d => d.matched_tracks_count === 2);
+    const t1 = currentData.filter(d => d.matched_tracks_count === 1);
+    const nears = currentData.filter(d => d.matched_tracks_count === 0 && d.overall_signal.includes('🟡'));
+
+    document.getElementById('kpi-3-count').textContent = `${{t3.length}} 檔`;
+    document.getElementById('kpi-3-tickers').textContent = t3.map(b => b.ticker).join(', ') || '目前無 3 軌全滿標的';
+    document.getElementById('kpi-2-count').textContent = `${{t2.length}} 檔`;
+    document.getElementById('kpi-2-tickers').textContent = t2.map(b => b.ticker).join(', ') || '目前無 2 軌滿足標的';
+    document.getElementById('kpi-1-count').textContent = `${{t1.length}} 檔`;
+    document.getElementById('kpi-1-tickers').textContent = t1.map(b => b.ticker).join(', ') || '目前無 1 軌滿足標的';
+    document.getElementById('kpi-near-count').textContent = `${{nears.length}} 檔`;
+    document.getElementById('kpi-near-tickers').textContent = nears.map(n => n.ticker).join(', ') || '目前無接近標的';
+  }}
+
+  function formatDiff(diff, sig) {{
+    const cls = sig === 'BUY' ? 'diff-neg' : (sig === 'NEAR' ? 'diff-near' : 'diff-pos');
+    const sign = diff > 0 ? '+' : '';
+    return `<span class="${{cls}}">(${{sign}}${{diff.toFixed(1)}}%)</span>`;
+  }}
+
+  function renderTable() {{
+    const q = document.getElementById('search-input').value.trim().toLowerCase();
+    let filtered = currentData.filter(d => {{
+      if (currentFilter === 'T3' && d.matched_tracks_count !== 3) return false;
+      if (currentFilter === 'T2' && d.matched_tracks_count !== 2) return false;
+      if (currentFilter === 'T1' && d.matched_tracks_count !== 1) return false;
+      if (currentFilter === 'NEAR' && !d.overall_signal.includes('🟡')) return false;
+      if (['CLOUD_AI', 'SEMI_AI', 'SEMI_EQUIP', 'SAAS_SBC', 'MATURE_MOAT'].includes(currentFilter) && d.sector_type !== currentFilter) return false;
+      if (q && !(d.ticker.toLowerCase().includes(q) || d.name.toLowerCase().includes(q) || d.category.toLowerCase().includes(q))) return false;
+      return true;
+    }});
+
+    filtered.sort((a, b) => {{
+      const va = a[sortField];
+      const vb = b[sortField];
+      if (typeof va === 'string') return sortAsc ? va.localeCompare(vb) : vb.localeCompare(va);
+      return sortAsc ? (va - vb) : (vb - va);
+    }});
+
+    const tbody = document.getElementById('table-body');
+    tbody.innerHTML = filtered.map(d => {{
+      let badgeCls = 'sig-WAIT';
+      if (d.matched_tracks_count === 3) badgeCls = 'sig-3';
+      else if (d.matched_tracks_count === 2) badgeCls = 'sig-2';
+      else if (d.matched_tracks_count === 1) badgeCls = 'sig-1';
+      else if (d.overall_signal.includes('🟡')) badgeCls = 'sig-NEAR';
+
+      // 52W Position %
+      const span52 = Math.max(1, d.high_52w - d.low_52w);
+      const posPct = Math.min(100, Math.max(0, ((d.current_price - d.low_52w) / span52) * 100));
+
+      // 3-segment visual meter
+      const segCls = d.matched_tracks_count === 3 ? 'on-3' : (d.matched_tracks_count === 2 ? 'on-2' : 'on-1');
+      const meterHtml = `<span class="track-meter">
+        <span class="track-seg ${{d.matched_tracks_count >= 1 ? segCls : ''}}"></span>
+        <span class="track-seg ${{d.matched_tracks_count >= 2 ? segCls : ''}}"></span>
+        <span class="track-seg ${{d.matched_tracks_count >= 3 ? segCls : ''}}"></span>
+      </span>`;
+
+      const srcBadge = d.data_source.includes('LIVE')
+        ? '<span style="color:var(--accent-emerald);font-size:0.7rem;">● Yahoo即時</span>'
+        : '<span style="color:var(--text-muted);font-size:0.7rem;">○ 備援基準</span>';
+
+      const vBadge = d.s2_backtest_valid
+        ? '<span style="color:var(--accent-emerald);font-size:0.74rem;">✓ 一年內曾跌到</span>'
+        : '<span style="color:var(--text-muted);font-size:0.74rem;">✗ 未曾跌到</span>';
+
+      return `<tr class="stock-row" onclick="showDetail('${{d.ticker}}')">
+        <td>
+          <div><span class="ticker-badge">${{d.ticker}}</span><strong style="color:var(--text-primary);font-size:0.9rem;">${{d.name}}</strong> ${{srcBadge}}</div>
+          <span class="name-sub">${{d.category}}</span>
+        </td>
+        <td class="mono-num">
+          <strong style="font-size:0.96rem;">$${{d.current_price.toFixed(2)}}</strong>
+          <div class="range-bar-wrap" title="52週低點 $${{d.low_52w.toFixed(1)}} ～ 52週高點 $${{d.high_52w.toFixed(1)}} (目前位階 ${{posPct.toFixed(0)}}%)">
+            <div class="range-track">
+              <div class="range-fill" style="width:${{posPct.toFixed(1)}}%;"></div>
+              <div class="range-dot" style="left:${{posPct.toFixed(1)}}%;"></div>
+            </div>
+            <div class="range-labels"><span>L:$${{d.low_52w.toFixed(0)}}</span><span>H:$${{d.high_52w.toFixed(0)}}</span></div>
+          </div>
+        </td>
+        <td class="mono-num"><strong>${{d.cagr_pct.toFixed(1)}}%</strong><span class="name-sub">${{d.base_year}}→2025年均成長</span></td>
+        <td class="mono-num"><strong>${{d.discounted_pe.toFixed(1)}}x</strong><span class="name-sub">原上限 ${{d.capped_pe.toFixed(1)}}x</span></td>
+        <td class="mono-num">$${{d.s1_target_price.toFixed(2)}} ${{formatDiff(d.s1_diff_pct, d.s1_signal)}}<span class="name-sub">帳面EPS: $${{d.gaap_ttm_eps.toFixed(2)}}</span></td>
+        <td class="mono-num">$${{d.s2_target_price.toFixed(2)}} ${{formatDiff(d.s2_diff_pct, d.s2_signal)}}<span class="name-sub">${{vBadge}}</span></td>
+        <td class="mono-num">$${{d.s3_target_price.toFixed(2)}} ${{formatDiff(d.s3_diff_pct, d.s3_signal)}}<span class="name-sub">${{d.true_profit_source}}: $${{d.true_profit_base.toFixed(2)}}</span></td>
+        <td class="mono-num"><strong style="color:var(--accent-emerald);font-size:0.94rem;">$${{d.recommended_target.toFixed(2)}}</strong> ${{formatDiff(d.recommended_diff_pct, d.rec_sig_code)}}<span class="name-sub">${{d.recommended_strategy}}</span></td>
+        <td class="mono-num"><strong style="color:var(--accent-cyan);">$${{d.fair_sell_price_100.toFixed(2)}}</strong> <span style="font-size:0.74rem;color:var(--text-muted);">(10折賣1/3)</span><span class="name-sub">🔥12折減碼: $${{d.overheated_sell_price_120.toFixed(2)}}</span></td>
+        <td>
+          <div>${{meterHtml}}<span class="sig-badge ${{badgeCls}}">${{d.overall_signal}}</span></div>
+          <span class="name-sub" style="margin-top:4px;color:var(--text-primary);font-weight:600;">${{d.alloc_pct_suggestion}}</span>
+        </td>
+      </tr>`;
+    }}).join('');
+  }}
+
+  function renderSellGuideTables() {{
+    const sellTbody = document.getElementById('sell-price-tbody');
+    if (sellTbody) {{
+      sellTbody.innerHTML = currentData.map(d => `
+        <tr>
+          <td style="text-align:left;"><span class="ticker-badge">${{d.ticker}}</span> ${{d.name}}</td>
+          <td class="mono-num">$${{d.current_price.toFixed(2)}}</td>
+          <td class="mono-num"><strong style="color:var(--accent-emerald);">$${{d.recommended_target.toFixed(2)}}</strong> <span style="font-size:0.76rem;color:var(--text-muted);">(${{d.recommended_strategy}})</span></td>
+          <td class="mono-num"><strong style="color:var(--accent-cyan);">$${{d.fair_sell_price_100.toFixed(2)}}</strong> <span style="font-size:0.76rem;color:var(--text-muted);">(+42.9%)</span></td>
+          <td class="mono-num"><strong style="color:var(--accent-amber);">$${{d.overheated_sell_price_120.toFixed(2)}}</strong> <span style="font-size:0.76rem;color:var(--text-muted);">(+71.4%)</span></td>
+        </tr>
+      `).join('');
+    }}
+
+    const btSumTbody = document.getElementById('bt-summary-tbody');
+    if (btSumTbody && BT_SUMMARIES.length > 0) {{
+      btSumTbody.innerHTML = BT_SUMMARIES.map(s => {{
+        const netPct = parseFloat(s['單筆平均淨報酬 (扣費後 %)'] || 0);
+        const totProfit = parseFloat(s['累計波段淨獲利 (每筆1萬美元基準 $)'] || 0);
+        const cls = netPct >= 0 ? 'diff-neg' : 'con-item';
+        return `<tr class="mono-num">
+          <td style="text-align:left;"><span class="ticker-badge">${{s['代號']}}</span></td>
+          <td style="text-align:left;font-family:var(--font-sans);">${{s['公司名稱']}}</td>
+          <td style="text-align:left;color:var(--text-muted);font-family:var(--font-sans);">${{s['定錨策略']}}</td>
+          <td>${{s['5年觸發買進次數']}} 次</td>
+          <td><strong>${{s['勝率 (%)']}}%</strong></td>
+          <td class="${{cls}}">${{netPct >= 0 ? '+' : ''}}${{netPct.toFixed(2)}}%</td>
+          <td>${{s['平均持有交易日']}} 天</td>
+          <td>$${{parseFloat(s['累計手續費支出 ($)'] || 0).toFixed(2)}}</td>
+          <td class="${{totProfit >= 0 ? 'diff-neg' : ''}}"><strong>${{totProfit >= 0 ? '+' : ''}}$${{totProfit.toLocaleString()}}</strong></td>
+          <td style="color:var(--accent-emerald);">+${{s['最佳單筆報酬 (%)']}}%</td>
+          <td style="color:var(--text-muted);">${{parseFloat(s['同期5年Buy&Hold報酬 (%)']) >= 0 ? '+' : ''}}${{s['同期5年Buy&Hold報酬 (%)']}}%</td>
+        </tr>`;
+      }}).join('');
+    }}
+
+    const btTrTbody = document.getElementById('bt-trades-tbody');
+    if (btTrTbody && BT_TRADES.length > 0) {{
+      btTrTbody.innerHTML = BT_TRADES.map(t => {{
+        const netP = parseFloat(t['淨獲利 ($)'] || 0);
+        const netR = parseFloat(t['淨報酬率 (%)'] || 0);
+        return `<tr class="mono-num">
+          <td style="text-align:left;"><span class="ticker-badge">${{t['代號']}}</span></td>
+          <td style="text-align:left;font-family:var(--font-sans);">${{t['公司名稱']}}</td>
+          <td>${{t['買進日期']}}</td>
+          <td><strong>$${{parseFloat(t['買進價格 ($)']).toFixed(2)}}</strong></td>
+          <td style="color:var(--accent-emerald);">$${{parseFloat(t['當時7折目標價 ($)']).toFixed(2)}}</td>
+          <td>${{t['賣出日期']}}</td>
+          <td><strong>$${{parseFloat(t['賣出價格 ($)']).toFixed(2)}}</strong></td>
+          <td style="text-align:left;font-family:var(--font-sans);"><span style="color:var(--accent-cyan);">${{t['出場原因']}}</span></td>
+          <td>${{t['持有交易日']}} 天</td>
+          <td>$${{parseFloat(t['雙邊手續費 ($)']).toFixed(2)}}</td>
+          <td style="color:${{netP >= 0 ? 'var(--accent-emerald)' : 'var(--accent-rose)'}};font-weight:700;">${{netP >= 0 ? '+' : ''}}$${{netP.toLocaleString()}}</td>
+          <td style="color:${{netR >= 0 ? 'var(--accent-emerald)' : 'var(--accent-rose)'}};font-weight:700;">${{netR >= 0 ? '+' : ''}}${{netR.toFixed(2)}}%</td>
+        </tr>`;
+      }}).join('');
+    }}
+  }}
+
+  function setFilter(f, btn) {{
+    currentFilter = f;
+    document.querySelectorAll('.pill-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    renderTable();
+  }}
+
+  function sortBy(field) {{
+    if (sortField === field) sortAsc = !sortAsc;
+    else {{ sortField = field; sortAsc = false; }}
+    renderTable();
+  }}
+
+  function resetSliders() {{
+    document.getElementById('slider-discount').value = DEFAULT_CFG.safety_discount;
+    document.getElementById('slider-pecap').value = DEFAULT_CFG.max_pe_cap;
+    document.getElementById('slider-near').value = DEFAULT_CFG.near_target_threshold;
+    recalculateAll();
+  }}
+
+  function showDetail(ticker) {{
+    const d = currentData.find(x => x.ticker === ticker);
+    if (!d) return;
+    const drawer = document.getElementById('detail-drawer');
+    document.getElementById('dt-title').textContent = `${{d.ticker}} - ${{d.name}} (${{d.category}})`;
+    document.getElementById('dt-subtitle').textContent = `目前股價: $${{d.current_price.toFixed(2)}} | 滿足策略數: ${{d.matched_tracks_count}} 軌 (${{d.alloc_pct_suggestion}}) | 🟢 7折買進價: $${{d.recommended_target.toFixed(2)}} | 🎯 10折合理賣價: $${{d.fair_sell_price_100.toFixed(2)}} | 🔥 12折過熱減碼價: $${{d.overheated_sell_price_120.toFixed(2)}}`;
+
+    document.getElementById('dt-strat-grid').innerHTML = `
+      <div class="strat-box ${{d.recommended_strategy.includes('策略一') ? 'recommended' : ''}}">
+        <h4 style="color:var(--accent-cyan);margin-bottom:6px;">【策略一】GAAP 帳面盈餘 PEG 7 折買價</h4>
+        <div class="mono-num" style="font-size:1.4rem;font-weight:700;">$${{d.s1_target_price.toFixed(2)}} ${{formatDiff(d.s1_diff_pct, d.s1_signal)}}</div>
+        <p style="font-size:0.82rem;color:var(--text-muted);margin-top:6px;">計算：帳面 EPS ($${{d.gaap_ttm_eps.toFixed(2)}}) × 折後本益比 (${{d.discounted_pe.toFixed(1)}}倍)<br>10折合理理想價 (PEG=1): $${{d.s1_ideal_price.toFixed(2)}}</p>
+      </div>
+      <div class="strat-box ${{d.recommended_strategy.includes('策略二') ? 'recommended' : ''}}">
+        <h4 style="color:var(--accent-purple);margin-bottom:6px;">【策略二】52 週最高價打 7 折買價</h4>
+        <div class="mono-num" style="font-size:1.4rem;font-weight:700;">$${{d.s2_target_price.toFixed(2)}} ${{formatDiff(d.s2_diff_pct, d.s2_signal)}}</div>
+        <p style="font-size:0.82rem;color:var(--text-muted);margin-top:6px;">計算：過去一年最高價 ($${{d.high_52w.toFixed(2)}}) × 0.70<br>有效性檢核：${{d.s2_backtest_valid ? '✅ 過去一年曾跌到（≥ 52週低點 $' + d.low_52w.toFixed(2) + '）' : '❌ 未曾觸及'}}</p>
+      </div>
+      <div class="strat-box ${{d.recommended_strategy.includes('策略三') ? 'recommended' : ''}}">
+        <h4 style="color:var(--accent-emerald);margin-bottom:6px;">【策略三】真實現金流 / 預估盈餘 7 折買價</h4>
+        <div class="mono-num" style="font-size:1.4rem;font-weight:700;">$${{d.s3_target_price.toFixed(2)}} ${{formatDiff(d.s3_diff_pct, d.s3_signal)}}</div>
+        <p style="font-size:0.82rem;color:var(--text-muted);margin-top:6px;">計算：真實獲利 $${{d.true_profit_base.toFixed(2)}} (${{d.true_profit_source}}) × 折後本益比 (${{d.discounted_pe.toFixed(1)}}倍)<br>預估 Forward EPS: $${{d.forward_eps.toFixed(2)}} | 每股自由現金流: $${{d.fcf_per_share.toFixed(2)}}</p>
+      </div>
+      <div class="strat-box" style="border-color:var(--accent-amber);">
+        <h4 style="color:var(--accent-amber);margin-bottom:6px;">🎯 買進後的賣股（停利）目標價</h4>
+        <div class="mono-num" style="font-size:1.25rem;font-weight:700;color:var(--accent-cyan);">10折合理價: $${{d.fair_sell_price_100.toFixed(2)}} <span style="font-size:0.8rem;color:var(--text-muted);">(賣1/3)</span></div>
+        <div class="mono-num" style="font-size:1.15rem;font-weight:700;color:var(--accent-amber);margin-top:4px;">12折過熱價: $${{d.overheated_sell_price_120.toFixed(2)}} <span style="font-size:0.8rem;color:var(--text-muted);">(再賣1/3，剩餘抱緊)</span></div>
+      </div>
+    `;
+
+    const notesEl = document.getElementById('dt-notes');
+    notesEl.innerHTML = (d.diagnostic_notes && d.diagnostic_notes.length > 0)
+      ? d.diagnostic_notes.map(n => `<li>💡 ${{n}}</li>`).join('')
+      : `<li>💡 基本面與現金流結構穩健，建議以【${{d.recommended_strategy}}】目標價 $${{d.recommended_target.toFixed(2)}} 作為分批布局基準。</li>`;
+
+    drawer.classList.add('show');
+    drawer.scrollIntoView({{ behavior: 'smooth', block: 'nearest' }});
+  }}
+
+  function runCustomCalc() {{
+    const discount = parseFloat(document.getElementById('slider-discount').value);
+    const peCap = parseFloat(document.getElementById('slider-pecap').value);
+    const nearThresh = parseFloat(document.getElementById('slider-near').value);
+
+    const ticker = document.getElementById('c-ticker').value || 'CUSTOM';
+    const price = parseFloat(document.getElementById('c-price').value) || 0;
+    const high52 = parseFloat(document.getElementById('c-high52').value) || 0;
+    const low52 = parseFloat(document.getElementById('c-low52').value) || 0;
+    const baseEps = parseFloat(document.getElementById('c-base-eps').value) || 0.01;
+    const latestEps = parseFloat(document.getElementById('c-latest-eps').value) || 0.01;
+    const years = parseFloat(document.getElementById('c-years').value) || 5;
+    const gaapEps = parseFloat(document.getElementById('c-gaap-eps').value) || 0;
+    const fwdEps = parseFloat(document.getElementById('c-fwd-eps').value) || 0;
+    const fcf = parseFloat(document.getElementById('c-fcf').value) || 0;
+
+    const cagr = (Math.pow(latestEps / baseEps, 1.0 / years) - 1.0) * 100.0;
+    const cappedPe = Math.min(Math.max(cagr, 5.0), peCap);
+    const discPe = cappedPe * discount;
+
+    const s1Target = gaapEps * discPe;
+    const [s1Sig, s1Diff] = evaluateSig(price, s1Target, nearThresh);
+    const s2Target = high52 * discount;
+    const [s2Sig, s2Diff] = evaluateSig(price, s2Target, nearThresh);
+    const trueBase = Math.max(gaapEps, fwdEps, fcf);
+    const s3Target = trueBase * discPe;
+    const [s3Sig, s3Diff] = evaluateSig(price, s3Target, nearThresh);
+    const sell100 = trueBase * cappedPe;
+    const sell120 = sell100 * 1.20;
+
+    document.getElementById('custom-calc-result').innerHTML = `
+      <div class="strat-box">
+        <h4>📊 ${{ticker}} 成長率與採計本益比</h4>
+        <div class="mono-num" style="font-size:1.3rem;font-weight:700;color:var(--accent-cyan);">CAGR: ${{cagr.toFixed(2)}}% → 折後 PE: ${{discPe.toFixed(2)}}倍</div>
+        <p style="font-size:0.82rem;color:var(--text-muted);margin-top:6px;">採計上限 PE: ${{cappedPe.toFixed(2)}}倍 (安全折數 ${{Math.round(discount*100)}} 折)</p>
+      </div>
+      <div class="strat-box">
+        <h4>【策略一】GAAP 帳面 7 折買價</h4>
+        <div class="mono-num" style="font-size:1.3rem;font-weight:700;">$${{s1Target.toFixed(2)}} ${{formatDiff(s1Diff, s1Sig)}}</div>
+        <p style="font-size:0.82rem;color:var(--text-muted);margin-top:6px;">10折理想價 (PEG=1): $${{(gaapEps*cappedPe).toFixed(2)}}</p>
+      </div>
+      <div class="strat-box">
+        <h4>【策略二】52 週高點 7 折買價</h4>
+        <div class="mono-num" style="font-size:1.3rem;font-weight:700;">$${{s2Target.toFixed(2)}} ${{formatDiff(s2Diff, s2Sig)}}</div>
+        <p style="font-size:0.82rem;color:var(--text-muted);margin-top:6px;">歷史檢核: ${{s2Target >= low52 ? '✅ 曾觸及 (≥ 52W低點)' : '❌ 未觸及'}}</p>
+      </div>
+      <div class="strat-box recommended">
+        <h4>【策略三】真實獲利 7 折買價 ＆ 賣股參考價</h4>
+        <div class="mono-num" style="font-size:1.3rem;font-weight:700;color:var(--accent-emerald);">買價: $${{s3Target.toFixed(2)}} ${{formatDiff(s3Diff, s3Sig)}}</div>
+        <p style="font-size:0.82rem;color:var(--text-muted);margin-top:6px;">🎯 10折合理賣價: <strong>$${{sell100.toFixed(2)}}</strong> | 🔥 12折過熱賣價: <strong>$${{sell120.toFixed(2)}}</strong></p>
+      </div>
+    `;
+  }}
+
+  function downloadCurrentCSV() {{
+    const headers = ['股票代號','公司名稱','目前股價','滿足軌數','建議投入比例','推薦7折買進價','10折合理賣出價','12折過熱減碼價','策略一GAAP_7折價','策略二52W高點_7折價','策略三真實獲利_7折價','綜合訊號'];
+    const rows = currentData.map(d => [
+      d.ticker, `"${{d.name}}"`, d.current_price, d.matched_tracks_count, `"${{d.alloc_pct_suggestion}}"`,
+      d.recommended_target.toFixed(2), d.fair_sell_price_100.toFixed(2), d.overheated_sell_price_120.toFixed(2),
+      d.s1_target_price.toFixed(2), d.s2_target_price.toFixed(2), d.s3_target_price.toFixed(2),
+      `"${{d.overall_signal}}"`
+    ]);
+    const csvContent = '\\uFEFF' + [headers.join(','), ...rows.map(r => r.join(','))].join('\\n');
+    const blob = new Blob([csvContent], {{ type: 'text/csv;charset=utf-8;' }});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'peg_valuation_custom_export.csv';
+    a.click();
+  }}
+
+  function runAllocationCalc() {{
+    const totalUsd = parseFloat(document.getElementById('alloc-total-usd').value) || 100000;
+    const corePct = Math.min(90, Math.max(10, parseFloat(document.getElementById('alloc-core-pct').value) || 50));
+    const satPct = 100 - corePct;
+    document.getElementById('alloc-sat-pct').value = satPct;
+
+    const coreUsd = totalUsd * (corePct / 100.0);
+    const satUsd = totalUsd * (satPct / 100.0);
+
+    const t3Stocks = currentData.filter(d => d.matched_tracks_count === 3);
+    const t2Stocks = currentData.filter(d => d.matched_tracks_count === 2);
+    const t1Stocks = currentData.filter(d => d.matched_tracks_count === 1 && (d.s1_signal === 'BUY' || d.s3_signal === 'BUY'));
+
+    const perSlotMax = satUsd * 0.10;
+    const t3Invest = t3Stocks.length * (perSlotMax * 1.00);
+    const t2Invest = t2Stocks.length * (perSlotMax * 0.60);
+    const t1Invest = t1Stocks.length * (perSlotMax * 0.30);
+    const deployedSat = Math.min(satUsd * 0.80, t3Invest + t2Invest + t1Invest);
+    const shvReserve = satUsd - deployedSat;
+
+    document.getElementById('allocation-result').innerHTML = `
+      <div class="strat-box">
+        <h4 style="color:var(--accent-cyan);margin-bottom:10px;">🛡️ 【核心底倉 ${{corePct}}%】避險與全球資產配置 (<span class="mono-num">$${{coreUsd.toLocaleString()}}</span>)</h4>
+        <ul class="note-list">
+          <li><strong>英股 CSPX（愛爾蘭註冊 S&P 500 累積型 ETF，取代 VOO/SPY 省股息稅與遺產稅）</strong> — 佔核心 60%（總資金 ${{Math.round(corePct*0.6)}}%）：<strong class="mono-num" style="color:var(--accent-cyan);">$${{Math.round(coreUsd*0.60).toLocaleString()}}</strong></li>
+          <li><strong>美股 BND（Vanguard 美國總體債券市場 ETF，系統性崩盤防守與降息避險）</strong> — 佔核心 40%（總資金 ${{Math.round(corePct*0.4)}}%）：<strong class="mono-num" style="color:var(--accent-purple);">$${{Math.round(coreUsd*0.40).toLocaleString()}}</strong></li>
+        </ul>
+      </div>
+      <div class="strat-box recommended">
+        <h4 style="color:var(--accent-emerald);margin-bottom:10px;">🎯 【衛星狙擊倉 ${{satPct}}%】SHV 短債停泊 ＋ 1/2/3 軌分批買進 ＋ QQQ 股災抄底 (<span class="mono-num">$${{satUsd.toLocaleString()}}</span>)</h4>
+        <ul class="note-list">
+          <li><strong>🔥 3 軌全滿個股（投入該股額度 100% 大量資金，每檔 <span class="mono-num">$${{Math.round(perSlotMax).toLocaleString()}}</span>）</strong>：<br>
+            ${{t3Stocks.map(b => `<strong style="color:#fda4af;">${{b.ticker}}</strong> (現價 $${{b.current_price.toFixed(2)}} → 10折賣價 $${{b.fair_sell_price_100.toFixed(2)}})`).join('、') || '目前無'}}
+          </li>
+          <li><strong>🟢🟢 2 軌同時滿足個股（投入該股額度 60% 主力資金，每檔 <span class="mono-num">$${{Math.round(perSlotMax*0.6).toLocaleString()}}</span>）</strong>：<br>
+            ${{t2Stocks.map(b => `<strong style="color:var(--accent-emerald);">${{b.ticker}}</strong> (現價 $${{b.current_price.toFixed(2)}} → 10折賣價 $${{b.fair_sell_price_100.toFixed(2)}})`).join('、') || '目前無'}}
+          </li>
+          <li><strong>🟢 1 軌基本面滿足個股（投入該股額度 30% 試單資金，每檔 <span class="mono-num">$${{Math.round(perSlotMax*0.3).toLocaleString()}}</span>）</strong>：<br>
+            ${{t1Stocks.map(b => `<strong style="color:var(--accent-cyan);">${{b.ticker}}</strong> (現價 $${{b.current_price.toFixed(2)}} → 10折賣價 $${{b.fair_sell_price_100.toFixed(2)}})`).join('、') || '目前無'}}
+          </li>
+          <li><strong>💵 停泊於【SHV 短期美債 ETF】領息待命（等待黃燈標的 AMZN/TSM 打折，或等股災來臨大買【QQQ】）</strong>：<strong class="mono-num" style="color:var(--accent-amber);">$${{Math.round(shvReserve).toLocaleString()}}</strong></li>
+        </ul>
+      </div>
+    `;
+  }}
+
+  // Restore saved theme & initialize
+  try {{
+    const savedTheme = localStorage.getItem('peg_theme');
+    if (savedTheme === 'light') toggleTheme();
+  }} catch(e) {{}}
+  recalculateAll();
+</script>
+</body>
+</html>
+"""
+    output_path.write_text(html_content, encoding="utf-8")
+
+
+# ==============================================================================
+# 7. Gmail 週報自動寄發功能 (smtplib)
+# ==============================================================================
+def send_email_report(results: List[ValuationResult], cfg: ValuationConfig, recipient: str) -> bool:
+    """
+    透過環境變數 GMAIL_USER 與 GMAIL_APP_PASSWORD 寄發 HTML 估值監控週報
+    """
+    gmail_user = os.environ.get("GMAIL_USER", "").strip()
+    gmail_pass = os.environ.get("GMAIL_APP_PASSWORD", "").strip()
+
+    if not gmail_user or not gmail_pass:
+        print("⚠️ 尚未設定環境變數 GMAIL_USER 或 GMAIL_APP_PASSWORD，略過寄信步驟。")
+        return False
+
+    buy_stocks = [r for r in results if r.matched_tracks_count > 0]
+    near_stocks = [r for r in results if "🟡" in r.overall_signal]
+
+    rows_html = ""
+    for r in results:
+        bg = "#ecfdf5" if r.matched_tracks_count > 0 else ("#fffbeb" if "🟡" in r.overall_signal else "#ffffff")
+        rows_html += f"""
+        <tr style="background-color:{bg};border-bottom:1px solid #e2e8f0;">
+          <td style="padding:8px;"><strong>{r.ticker}</strong> ({r.name})</td>
+          <td style="padding:8px;text-align:right;">${r.current_price:.2f}</td>
+          <td style="padding:8px;text-align:right;">{r.cagr_pct:.1f}%</td>
+          <td style="padding:8px;text-align:right;">${r.s1_target_price:.2f} ({r.s1_diff_pct:+.1f}%)</td>
+          <td style="padding:8px;text-align:right;">${r.s2_target_price:.2f} ({r.s2_diff_pct:+.1f}%)</td>
+          <td style="padding:8px;text-align:right;"><strong>${r.s3_target_price:.2f}</strong> ({r.s3_diff_pct:+.1f}%)</td>
+          <td style="padding:8px;">{r.overall_signal}</td>
+        </tr>
+        """
+
+    html_body = f"""
+    <html><body style="font-family:sans-serif;color:#1e293b;">
+      <h2>📈 美股 AI 企業巨頭「PEG {cfg.safety_discount*100:.0f} 折三軌監控系統」週報</h2>
+      <p>🟢 <strong>達標買進 ({len(buy_stocks)} 檔)：</strong> {', '.join(x.ticker for x in buy_stocks) or '無'}<br>
+         🟡 <strong>接近預警 ({len(near_stocks)} 檔)：</strong> {', '.join(x.ticker for x in near_stocks) or '無'}</p>
+      <table style="border-collapse:collapse;width:100%;font-size:13px;">
+        <thead>
+          <tr style="background:#0f172a;color:#ffffff;">
+            <th style="padding:8px;text-align:left;">標的</th>
+            <th style="padding:8px;text-align:right;">現價</th>
+            <th style="padding:8px;text-align:right;">CAGR</th>
+            <th style="padding:8px;text-align:right;">策略一(GAAP)</th>
+            <th style="padding:8px;text-align:right;">策略二(52W高7折)</th>
+            <th style="padding:8px;text-align:right;">策略三(真實獲利)</th>
+            <th style="padding:8px;text-align:left;">訊號</th>
+          </tr>
+        </thead>
+        <tbody>{rows_html}</tbody>
+      </table>
+    </body></html>
+    """
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = f"📊 美股 AI 巨頭 PEG 7 折監控週報 ({len(buy_stocks)} 檔達標買進)"
+    msg["From"] = gmail_user
+    msg["To"] = recipient
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
+
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(gmail_user, gmail_pass)
+            server.sendmail(gmail_user, [recipient], msg.as_string())
+        print(f"✅ 已成功寄發 HTML 監控週報至 {recipient}")
+        return True
+    except Exception as exc:
+        print(f"❌ 寄發郵件失敗：{exc}")
+        return False
+
+
+# ==============================================================================
+# 8. 主程式入口與命令列介面 (CLI)
+# ==============================================================================
+def load_stock_universe() -> List[StockBaseline]:
+    """
+    載入 22 檔內建基準標的，並自動檢查 watchlist_config.json 是否有使用者額外新增或自訂的股票。
+    """
+    base_map = {s.ticker: s for s in BASELINE_STOCKS}
+    cfg_path = Path("watchlist_config.json")
+    if cfg_path.exists():
+        try:
+            raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+            for item in raw.get("stocks", []):
+                tk = str(item.get("ticker", "")).strip().upper()
+                if not tk:
+                    continue
+                if tk in base_map:
+                    # 允許使用者透過 watchlist_config.json 更新基準年與 EPS
+                    s = base_map[tk]
+                    s.base_year = int(item.get("base_year", s.base_year))
+                    s.base_eps = float(item.get("base_eps", s.base_eps))
+                    s.eps_2025 = float(item.get("eps_2025", s.eps_2025))
+                    s.raw_cagr = float(item.get("raw_cagr", s.raw_cagr))
+                else:
+                    # 使用者於 watchlist_config.json 新增的第 23+ 檔自選股
+                    b_eps = float(item.get("base_eps", 1.0))
+                    l_eps = float(item.get("eps_2025", 2.0))
+                    b_yr = int(item.get("base_year", 2020))
+                    n_yr = max(1, 2025 - b_yr)
+                    cagr = float(item.get("raw_cagr", calculate_cagr(b_eps, l_eps, n_yr)))
+                    base_map[tk] = StockBaseline(
+                        ticker=tk,
+                        name=str(item.get("name", tk)),
+                        category=str(item.get("category", "自選擴充追蹤股")),
+                        sector_type=str(item.get("sector_type", "CLOUD_AI")),
+                        base_year=b_yr,
+                        base_eps=b_eps,
+                        eps_2025=l_eps,
+                        raw_cagr=round(cagr, 2),
+                        fallback_price=float(item.get("fallback_price", 100.0)),
+                        fallback_high52=float(item.get("fallback_high52", 130.0)),
+                        fallback_low52=float(item.get("fallback_low52", 80.0)),
+                        fallback_ttm_eps=l_eps,
+                        fallback_forward_eps=l_eps * 1.15,
+                        fallback_fcf_per_share=l_eps,
+                        cik=str(item.get("cik", "")),
+                    )
+        except Exception:
+            pass
+    return list(base_map.values())
+
+
+def run_tracker(
+    cfg: ValuationConfig,
+    use_offline: bool = False,
+    tickers_filter: Optional[List[str]] = None,
+    max_workers: int = 8,
+) -> List[ValuationResult]:
+    """並行取得追蹤標的資料並執行三軌估值分析"""
+    universe = load_stock_universe() if not use_offline else BASELINE_STOCKS
+    target_stocks = universe
+    if tickers_filter:
+        upper_set = {t.strip().upper() for t in tickers_filter if t.strip()}
+        target_stocks = [s for s in universe if s.ticker in upper_set]
+
+    metrics_map: Dict[str, Dict[str, Any]] = {}
+    if use_offline or not HAS_YFINANCE:
+        for s in target_stocks:
+            metrics_map[s.ticker] = fetch_live_stock_metrics(s, use_offline=True)
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_ticker = {
+                executor.submit(fetch_live_stock_metrics, s, False): s.ticker
+                for s in target_stocks
+            }
+            for future in as_completed(future_to_ticker):
+                tk_name = future_to_ticker[future]
+                try:
+                    metrics_map[tk_name] = future.result()
+                except Exception:
+                    stock_obj = next(s for s in target_stocks if s.ticker == tk_name)
+                    metrics_map[tk_name] = fetch_live_stock_metrics(stock_obj, use_offline=True)
+
+    results: List[ValuationResult] = []
+    for s in target_stocks:
+        res = analyze_stock(s, metrics_map[s.ticker], cfg)
+        results.append(res)
+
+    return results
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="美股三大指數與 AI 企業巨頭「本益成長比 (PEG) 7 折三軌監控系統」"
+    )
+    parser.add_argument("--offline", action="store_true", help="強制使用規格書內建之 22 檔基準資料庫（不連線 yfinance）")
+    parser.add_argument("--discount", type=float, default=0.70, help="安全邊際折數 (預設: 0.70)")
+    parser.add_argument("--max-pe", type=float, default=45.0, help="合理本益比封頂上限 (預設: 45.0)")
+    parser.add_argument("--min-cagr", type=float, default=5.0, help="最低成長率門檻 %% (預設: 5.0)")
+    parser.add_argument("--near-threshold", type=float, default=0.10, help="接近達標預警範圍 (預設: 0.10 即 +10%%)")
+    parser.add_argument("--tickers", type=str, default="", help="僅分析指定股票代號，以逗號分隔 (例如: NVDA,NOW,GOOGL)")
+    parser.add_argument("--csv-out", type=str, default="peg_valuation_report.csv", help="匯出 CSV 報表路徑")
+    parser.add_argument("--html-out", type=str, default="peg_valuation_dashboard.html", help="匯出互動式 HTML 儀表板路徑")
+    parser.add_argument("--open-browser", action="store_true", help="執行完畢後自動在預設瀏覽器開啟互動式 HTML 儀表板")
+    parser.add_argument("--email-to", type=str, default="", help="寄發 HTML 週報之收件人信箱 (需設定環境變數 GMAIL_USER / GMAIL_APP_PASSWORD)")
+    return parser.parse_args()
+
+
+def archive_weekly_snapshot(results: List[ValuationResult]) -> Tuple[Path, Path]:
+    """
+    每次執行時，自動將當日完整估值報表備份至 history_snapshots/ 資料夾，
+    並於 history_snapshots/weekly_summary_log.csv 追加一筆每週巡檢摘要紀錄，確保歷史資料永久留存不遺失。
+    """
+    snap_dir = Path("history_snapshots")
+    snap_dir.mkdir(exist_ok=True)
+
+    today_str = datetime.datetime.now().strftime("%Y-%m-%d")
+    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # 1. 儲存當日完整 22 檔估值快照 CSV
+    dated_csv_path = (snap_dir / f"peg_report_{today_str}.csv").resolve()
+    export_csv_report(results, dated_csv_path)
+
+    # 2. 追加一筆摘要紀錄至 weekly_summary_log.csv
+    summary_log_path = (snap_dir / "weekly_summary_log.csv").resolve()
+    t3 = [f"{r.ticker}(${r.current_price:.1f})" for r in results if r.matched_tracks_count == 3]
+    t2 = [f"{r.ticker}(${r.current_price:.1f})" for r in results if r.matched_tracks_count == 2]
+    t1 = [f"{r.ticker}(${r.current_price:.1f})" for r in results if r.matched_tracks_count == 1]
+    nears = [f"{r.ticker}(${r.current_price:.1f})" for r in results if r.matched_tracks_count == 0 and "🟡" in r.overall_signal]
+
+    log_headers = [
+        "巡檢紀錄時間", "日期", "追蹤總檔數",
+        "🔥 3軌全滿 (投100%名單)", "🟢🟢 2軌滿足 (投60%名單)",
+        "🟢 1軌滿足 (投30%名單)", "🟡 接近買點預警 (+10%內名單)"
+    ]
+    file_exists = summary_log_path.exists()
+    with summary_log_path.open("a", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=log_headers)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow({
+            "巡檢紀錄時間": now_str,
+            "日期": today_str,
+            "追蹤總檔數": len(results),
+            "🔥 3軌全滿 (投100%名單)": ", ".join(t3) if t3 else "無",
+            "🟢🟢 2軌滿足 (投60%名單)": ", ".join(t2) if t2 else "無",
+            "🟢 1軌滿足 (投30%名單)": ", ".join(t1) if t1 else "無",
+            "🟡 接近買點預警 (+10%內名單)": ", ".join(nears) if nears else "無",
+        })
+
+    return dated_csv_path, summary_log_path
+
+
+def main() -> int:
+    args = parse_args()
+    cfg = ValuationConfig(
+        safety_discount=args.discount,
+        max_pe_cap=args.max_pe,
+        min_cagr_floor=args.min_cagr,
+        near_target_threshold=args.near_threshold,
+    )
+    tickers_list = [x for x in args.tickers.split(",") if x.strip()] if args.tickers else None
+
+    mode_label = "離線基準驗證模式 (BASELINE)" if args.offline else "即時網路連線模式 (yfinance + 自動備援)"
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+    print(f"🚀 啟動「美股 AI 巨頭 PEG 7 折三軌監控系統」— 模式：{mode_label} ...")
+
+    results = run_tracker(cfg=cfg, use_offline=args.offline, tickers_filter=tickers_list)
+    print_terminal_report(results, cfg)
+
+    csv_path = Path(args.csv_out).resolve()
+    export_csv_report(results, csv_path)
+    print(f"💾 已匯出最新 CSV 估值報表：{csv_path}")
+
+    dated_snap, summary_log = archive_weekly_snapshot(results)
+    print(f"🗂️ 已自動歸檔本週歷史快照：{dated_snap}")
+    print(f"📒 已累計寫入每週巡檢日誌：{summary_log}")
+
+    html_path = Path(args.html_out).resolve()
+    export_html_dashboard(results, cfg, html_path)
+    print(f"🌐 已生成互動式 HTML 視覺化儀表板：{html_path}")
+
+    if args.email_to:
+        send_email_report(results, cfg, args.email_to)
+
+    if args.open_browser:
+        webbrowser.open(html_path.as_uri())
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+

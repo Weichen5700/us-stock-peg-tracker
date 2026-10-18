@@ -1,0 +1,248 @@
+{
+  "_說明": "此檔案為『美股 PEG 7 折三軌監控系統』的追蹤股票池設定檔。預設收錄四大指數（標普500、那斯達克100、費半、道瓊）最具代表性的 22 檔 AI 與護城河巨頭。每次執行 run_tracker.bat 時，系統會自動透過 Yahoo Finance (yfinance) 即時抓取最新股價、52週高低點、GAAP TTM EPS、Forward EPS 與每股自由現金流 (FCF/Share)。若您未來想新增其他美股，可依照下方格式新增一筆物件。",
+  "last_annual_review": "2026-10",
+  "stocks": [
+    {
+      "ticker": "GOOGL",
+      "name": "Alphabet",
+      "category": "AI 雲端基建 (那斯達克/FANG+)",
+      "sector_type": "CLOUD_AI",
+      "base_year": 2020,
+      "base_eps": 2.96,
+      "eps_2025": 10.91,
+      "raw_cagr": 29.81,
+      "cik": "0001652044"
+    },
+    {
+      "ticker": "NVDA",
+      "name": "NVIDIA",
+      "category": "AI 算力與 NIM 企業軟體 (費半/道瓊)",
+      "sector_type": "SEMI_AI",
+      "base_year": 2020,
+      "base_eps": 0.16,
+      "eps_2025": 4.06,
+      "raw_cagr": 90.93,
+      "cik": "0001045810"
+    },
+    {
+      "ticker": "NFLX",
+      "name": "Netflix",
+      "category": "串流與 AI 推薦巨頭 (那斯達克/FANG+)",
+      "sector_type": "CLOUD_AI",
+      "base_year": 2020,
+      "base_eps": 0.63,
+      "eps_2025": 2.58,
+      "raw_cagr": 32.57,
+      "cik": "0001065280"
+    },
+    {
+      "ticker": "ORCL",
+      "name": "Oracle",
+      "category": "企業資料庫與 OCI AI 雲 (標普500)",
+      "sector_type": "ENT_SW",
+      "base_year": 2019,
+      "base_eps": 3.23,
+      "eps_2025": 5.94,
+      "raw_cagr": 12.96,
+      "cik": "0001341439"
+    },
+    {
+      "ticker": "INTU",
+      "name": "Intuit",
+      "category": "中小企業財稅 AI (那斯達克)",
+      "sector_type": "SAAS_SBC",
+      "base_year": 2020,
+      "base_eps": 7.52,
+      "eps_2025": 14.73,
+      "raw_cagr": 14.39,
+      "cik": "0000896878"
+    },
+    {
+      "ticker": "AVGO",
+      "name": "Broadcom",
+      "category": "AI ASIC 與 VMware 私有雲 (費半)",
+      "sector_type": "SEMI_AI",
+      "base_year": 2020,
+      "base_eps": 0.66,
+      "eps_2025": 4.90,
+      "raw_cagr": 49.32,
+      "cik": "0001730168"
+    },
+    {
+      "ticker": "ADBE",
+      "name": "Adobe",
+      "category": "Firefly 企業行銷設計 AI (那斯達克)",
+      "sector_type": "SAAS_SBC",
+      "base_year": 2020,
+      "base_eps": 10.94,
+      "eps_2025": 16.73,
+      "raw_cagr": 8.87,
+      "cik": "0000796343"
+    },
+    {
+      "ticker": "IBM",
+      "name": "IBM",
+      "category": "watsonx 企業混合雲與 AI 諮詢 (道瓊)",
+      "sector_type": "MATURE_MOAT",
+      "base_year": 2020,
+      "base_eps": 6.27,
+      "eps_2025": 11.35,
+      "raw_cagr": 12.60,
+      "cik": "0000051143"
+    },
+    {
+      "ticker": "AMZN",
+      "name": "Amazon",
+      "category": "AWS Bedrock 企業 AI 雲 (道瓊/那斯達克)",
+      "sector_type": "CLOUD_AI",
+      "base_year": 2020,
+      "base_eps": 2.13,
+      "eps_2025": 7.29,
+      "raw_cagr": 27.90,
+      "cik": "0001018724"
+    },
+    {
+      "ticker": "NOW",
+      "name": "ServiceNow",
+      "category": "Now Assist 企業工作流 AI 代理 (標普500)",
+      "sector_type": "SAAS_SBC",
+      "base_year": 2020,
+      "base_eps": 0.12,
+      "eps_2025": 1.69,
+      "raw_cagr": 69.72,
+      "cik": "0001373715"
+    },
+    {
+      "ticker": "ACN",
+      "name": "Accenture",
+      "category": "全球最大企業 AI 導入顧問 (標普500)",
+      "sector_type": "MATURE_MOAT",
+      "base_year": 2020,
+      "base_eps": 8.27,
+      "eps_2025": 12.21,
+      "raw_cagr": 8.10,
+      "cik": "0001467373"
+    },
+    {
+      "ticker": "PANW",
+      "name": "Palo Alto",
+      "category": "Precision AI 企業資安平台 (那斯達克)",
+      "sector_type": "SAAS_SBC",
+      "base_year": 2023,
+      "base_eps": 1.00,
+      "eps_2025": 1.67,
+      "raw_cagr": 29.23,
+      "cik": "0001327567"
+    },
+    {
+      "ticker": "PLTR",
+      "name": "Palantir",
+      "category": "AIP 企業資料與決策 AI 平台 (那斯達克)",
+      "sector_type": "SAAS_SBC",
+      "base_year": 2023,
+      "base_eps": 0.09,
+      "eps_2025": 0.69,
+      "raw_cagr": 176.69,
+      "cik": "0001321655"
+    },
+    {
+      "ticker": "CRM",
+      "name": "Salesforce",
+      "category": "Agentforce 企業客戶 AI 代理 (道瓊)",
+      "sector_type": "SAAS_SBC",
+      "base_year": 2020,
+      "base_eps": 3.92,
+      "eps_2025": 7.56,
+      "raw_cagr": 14.04,
+      "cik": "0001108524"
+    },
+    {
+      "ticker": "TSM",
+      "name": "TSMC (ADR)",
+      "category": "AI 晶片製造龍頭 (費半)",
+      "sector_type": "SEMI_AI",
+      "base_year": 2020,
+      "base_eps": 3.56,
+      "eps_2025": 10.60,
+      "raw_cagr": 24.39,
+      "cik": "0001046179"
+    },
+    {
+      "ticker": "MSFT",
+      "name": "Microsoft",
+      "category": "Copilot 與 Azure 企業 AI (道瓊/那斯達克)",
+      "sector_type": "MATURE_MOAT",
+      "base_year": 2020,
+      "base_eps": 6.78,
+      "eps_2025": 16.04,
+      "raw_cagr": 18.79,
+      "cik": "0000789019"
+    },
+    {
+      "ticker": "META",
+      "name": "Meta",
+      "category": "Llama 開源 AI 與廣告巨頭 (那斯達克)",
+      "sector_type": "CLOUD_AI",
+      "base_year": 2020,
+      "base_eps": 10.23,
+      "eps_2025": 23.97,
+      "raw_cagr": 18.57,
+      "cik": "0001326801"
+    },
+    {
+      "ticker": "KLAC",
+      "name": "KLA",
+      "category": "半導體製程檢測龍頭 (費半/那斯達克)",
+      "sector_type": "SEMI_EQUIP",
+      "base_year": 2020,
+      "base_eps": 0.88,
+      "eps_2025": 3.46,
+      "raw_cagr": 31.50,
+      "cik": "0000319201"
+    },
+    {
+      "ticker": "ASML",
+      "name": "ASML",
+      "category": "EUV 微影設備龍頭 (費半/那斯達克)",
+      "sector_type": "SEMI_EQUIP",
+      "base_year": 2020,
+      "base_eps": 9.99,
+      "eps_2025": 28.52,
+      "raw_cagr": 23.34,
+      "cik": "0000937966"
+    },
+    {
+      "ticker": "AMAT",
+      "name": "Applied Mat.",
+      "category": "半導體設備龍頭 (費半/那斯達克)",
+      "sector_type": "SEMI_EQUIP",
+      "base_year": 2020,
+      "base_eps": 3.95,
+      "eps_2025": 8.72,
+      "raw_cagr": 17.16,
+      "cik": "0000006951"
+    },
+    {
+      "ticker": "LRCX",
+      "name": "Lam Research",
+      "category": "半導體蝕刻設備龍頭 (費半/那斯達克)",
+      "sector_type": "SEMI_EQUIP",
+      "base_year": 2020,
+      "base_eps": 2.05,
+      "eps_2025": 4.90,
+      "raw_cagr": 19.04,
+      "cik": "0000707549"
+    },
+    {
+      "ticker": "AAPL",
+      "name": "Apple",
+      "category": "Apple Intelligence 終端 AI (道瓊/那斯達克)",
+      "sector_type": "MATURE_MOAT",
+      "base_year": 2020,
+      "base_eps": 3.74,
+      "eps_2025": 7.92,
+      "raw_cagr": 16.19,
+      "cik": "0000320193"
+    }
+  ]
+}

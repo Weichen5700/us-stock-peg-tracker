@@ -1,0 +1,16 @@
+# Python 編譯與快取檔案
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# 虛擬環境與環境變數（防範誤傳個人信箱密碼）
+.venv/
+venv/
+env/
+.env
+*.env
+
+# 作業系統暫存檔
+.DS_Store
+Thumbs.db
