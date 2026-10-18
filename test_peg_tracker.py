@@ -12,9 +12,10 @@ from us_ai_peg_tracker import (
     calculate_cagr,
     evaluate_signal,
     fetch_live_stock_metrics,
+    load_stock_universe,
     run_tracker,
 )
-from peg_backtester import BacktestConfig, run_full_backtest
+from peg_backtester import BacktestConfig, HISTORICAL_PIT_EPS_DB, run_full_backtest
 
 
 def test_cagr_formula_matches_spec():
@@ -50,6 +51,57 @@ def test_servicenow_three_track_example():
     assert res.s2_backtest_valid is True
 
 
+def test_track_1_3_deduplication_when_identical():
+    """驗證當策略一與策略三因獲利基數相同（差距 < 3%）同時觸發買進且策略二未觸發時，自動去重算作 1 軌"""
+    cfg = ValuationConfig()
+    googl = next(s for s in BASELINE_STOCKS if s.ticker == "GOOGL")
+    metrics = {
+        "price": 180.0,
+        "high52": 240.0,  # s2_target = 168.0 < 180.0 (WAIT)
+        "low52": 150.0,
+        "ttm_eps": 10.91,
+        "forward_eps": 10.91,  # 與 GAAP 完全相同
+        "fcf_per_share": 9.50,
+        "data_source": "HYBRID (即時報價 + 備援:Forward_EPS)",
+        "fallback_fields": ["Forward_EPS"],
+    }
+    res = analyze_stock(googl, metrics, cfg)
+    assert res.s1_signal == "BUY"
+    assert res.s3_signal == "BUY"
+    assert res.s2_signal != "BUY"
+    assert res.matched_tracks_count == 1
+    assert "同源獲利" in res.overall_signal
+
+
+def test_fundamental_circuit_breaker():
+    """驗證價值陷阱防禦鎖：當觸發 >=2 軌買進，但當期 EPS 較基準衰退超過 20% 或自高點深跌超過 45% 時，強制限制在 30% 試單倉"""
+    cfg = ValuationConfig()
+    adbe = next(s for s in BASELINE_STOCKS if s.ticker == "ADBE")
+    metrics = {
+        "price": 100.0,
+        "high52": 250.0,  # 深跌 -60% (<= -45%)
+        "low52": 95.0,
+        "ttm_eps": 11.0,  # 較 2025 基準 16.01 衰退 > 20%
+        "forward_eps": 20.5,
+        "fcf_per_share": 20.0,
+        "data_source": "LIVE",
+        "fallback_fields": [],
+    }
+    res = analyze_stock(adbe, metrics, cfg)
+    assert res.matched_tracks_count >= 2
+    assert res.circuit_breaker_triggered is True
+    assert "30%" in res.alloc_pct_suggestion
+    assert "防禦鎖" in res.overall_signal
+
+
+def test_load_stock_universe_does_not_mutate_baseline():
+    """驗證載入 watchlist_config.json 不會變動全域 BASELINE_STOCKS 常數物件"""
+    orig_nvda = next(s for s in BASELINE_STOCKS if s.ticker == "NVDA")
+    universe = load_stock_universe()
+    loaded_nvda = next(s for s in universe if s.ticker == "NVDA")
+    assert orig_nvda is not loaded_nvda
+
+
 def test_all_22_stocks_offline_execution():
     """驗證全部 22 檔追蹤標的在離線備援模式下可完整計算且無任何缺漏"""
     cfg = ValuationConfig()
@@ -72,8 +124,11 @@ def test_signal_threshold_logic():
     assert round(diff_wait, 2) == 15.00
 
 
-def test_five_year_backtest_engine():
-    """驗證近五年歷史回測引擎扣除手續費後之完整性與合理性"""
+def test_point_in_time_causal_eps_and_five_year_backtest():
+    """驗證近五年歷史回測引擎採用無前視偏差 (Point-in-Time) 滾動 EPS/CAGR 與三段式分批停利驗證"""
+    assert len(HISTORICAL_PIT_EPS_DB) == 22
+    assert HISTORICAL_PIT_EPS_DB["NVDA"][2021][0] < HISTORICAL_PIT_EPS_DB["NVDA"][2025][0]
+
     bt_cfg = BacktestConfig()
     res = run_full_backtest(bt_cfg)
     portfolios = res["portfolios"]
@@ -88,7 +143,9 @@ def test_five_year_backtest_engine():
     s3_p = portfolios[1]
     spy_p = next(p for p in portfolios if p.strategy_id == "SPY")
 
-    # 驗證智慧三軌與策略三在扣除 0.15% 單邊手續費後，均顯著創造正報酬並擊敗 SPY 大盤
     assert smart_p.final_equity > spy_p.final_equity
     assert s3_p.final_equity > spy_p.final_equity
     assert smart_p.total_fees_paid > 0
+    assert any(s.staged_3tier_return_pct > 0 for s in summaries if s.trade_count > 0)
+
+

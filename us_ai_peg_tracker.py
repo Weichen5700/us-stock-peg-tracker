@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import dataclasses
 import datetime
 import json
 import math
@@ -34,7 +35,7 @@ import smtplib
 import sys
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -231,7 +232,7 @@ class ValuationResult:
     name: str
     category: str
     sector_type: str
-    data_source: str              # 'LIVE (yfinance)' 或 'BASELINE (備援)'
+    data_source: str              # 'LIVE (yfinance 全欄位即時)' / 'HYBRID (即時報價 + 備援:...)' / 'BASELINE (離線基準快照)'
 
     # 歷史成長率指標
     base_year: int
@@ -273,7 +274,7 @@ class ValuationResult:
     recommended_target: float     # 推薦主策略之目標價
     recommended_diff_pct: float   # 現價與推薦目標價差距 (%)
     overall_signal: str           # 綜合燈號 ('🟢 達標買進' / '🟡 接近預警' / '⚪ 觀望等待')
-    matched_tracks_count: int = 0 # 同時滿足幾個策略 (0, 1, 2, 3)
+    matched_tracks_count: int = 0 # 同時滿足幾個獨立策略 (0, 1, 2, 3；已扣除同源重複訊號)
     alloc_pct_suggestion: str = ""# 根據滿足軌數建議投入該股額度之資金比例 (0% / 30% / 60% / 100%)
     fair_sell_price_100: float = 0.0       # 10 折合理價值賣出參考價 (PEG=1.0 或回歸合理價，較7折價高出 +42.86%)
     overheated_sell_price_120: float = 0.0 # 12 折過熱減碼參考價 (PEG=1.2，較7折價高出 +71.4%)
@@ -281,13 +282,15 @@ class ValuationResult:
     current_true_pe: float = 0.0  # 目前真實獲利本益比
     current_peg_true: float = 0.0 # 目前真實獲利 PEG
     drawdown_from_high_pct: float = 0.0 # 目前距離 52 週高點回檔幅度 (%)
+    circuit_breaker_triggered: bool = False # 是否觸發價值陷阱防禦鎖
+    fallback_fields: List[str] = field(default_factory=list) # 標記哪些欄位退回使用備援基準
     diagnostic_notes: List[str] = field(default_factory=list)
 
 
 # ==============================================================================
-# 4. 網路財務資料擷取器 (yfinance & SEC EDGAR)
+# 4. 網路財務資料擷取器 (yfinance & SEC EDGAR & 動態匯率/SHV殖利率)
 # ==============================================================================
-def fetch_sec_edgar_eps(cik: str, user_agent: str = "AntigravityPEGTracker/1.0 (contact@example.com)") -> Optional[Dict[int, float]]:
+def fetch_sec_edgar_eps(cik: str, user_agent: str = "AntigravityPEGTracker/2.0 (research@example.com)") -> Optional[Dict[int, float]]:
     """
     透過美國證管會 SEC EDGAR 官方免費 API 抓取歷年 10-K GAAP Diluted EPS
     端點：https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json
@@ -312,7 +315,6 @@ def fetch_sec_edgar_eps(cik: str, user_agent: str = "AntigravityPEGTracker/1.0 (
                 val = item.get("val")
                 frame = item.get("frame", "")
                 if isinstance(fy, int) and isinstance(val, (int, float)):
-                    # 優先採用帶有標準年度 frame (如 CY2024) 的年報數據
                     if f"CY{fy}" in frame or fy not in annual_eps:
                         annual_eps[fy] = float(val)
         return annual_eps if annual_eps else None
@@ -320,23 +322,86 @@ def fetch_sec_edgar_eps(cik: str, user_agent: str = "AntigravityPEGTracker/1.0 (
         return None
 
 
-def fetch_live_stock_metrics(stock: StockBaseline, use_offline: bool = False) -> Dict[str, Any]:
+def fetch_market_context(use_offline: bool = False) -> Dict[str, Any]:
     """
-    從 yfinance 抓取單一標的即時報價與財務指標；
-    若處於離線模式或特定指標為 None / 異常，則無縫退回基準資料庫 (Fallback)。
+    動態抓取跨國 ADR 財報換算所需之即時匯率 (TWD/USD, EUR/USD, JPY/USD, GBP/USD)
+    以及短期國庫券 ETF (SHV) 之最新年化配息殖利率；若處於離線模式則退回安全預設值。
     """
-    result = {
+    ctx: Dict[str, Any] = {
+        "fx_to_usd": {
+            "TWD": 1.0 / 32.0,
+            "EUR": 1.09,
+            "JPY": 1.0 / 150.0,
+            "GBP": 1.28,
+        },
+        "shv_yield_pct": 4.65,
+        "fx_source": "預設基準匯率",
+    }
+    if use_offline or not HAS_YFINANCE:
+        return ctx
+
+    try:
+        # 嘗試快速讀取 TWD=X, EURUSD=X 與 SHV
+        twd_info = yf.Ticker("TWD=X").fast_info
+        twd_rate = getattr(twd_info, "last_price", None)
+        if isinstance(twd_rate, (int, float)) and 20.0 < twd_rate < 45.0:
+            ctx["fx_to_usd"]["TWD"] = 1.0 / float(twd_rate)
+            ctx["fx_source"] = f"即時匯率 (USD/TWD={twd_rate:.2f})"
+    except Exception:
+        pass
+
+    try:
+        eur_info = yf.Ticker("EURUSD=X").fast_info
+        eur_rate = getattr(eur_info, "last_price", None)
+        if isinstance(eur_rate, (int, float)) and 0.80 < eur_rate < 1.50:
+            ctx["fx_to_usd"]["EUR"] = float(eur_rate)
+    except Exception:
+        pass
+
+    try:
+        shv_info = yf.Ticker("SHV").info or {}
+        raw_yield = shv_info.get("yield") or shv_info.get("trailingAnnualDividendYield")
+        if isinstance(raw_yield, (int, float)) and 0.001 < raw_yield < 0.15:
+            ctx["shv_yield_pct"] = round(float(raw_yield) * 100.0, 2)
+    except Exception:
+        pass
+
+    return ctx
+
+
+def fetch_live_stock_metrics(
+    stock: StockBaseline,
+    use_offline: bool = False,
+    use_sec_edgar: bool = False,
+    fx_to_usd: Optional[Dict[str, float]] = None,
+) -> Dict[str, Any]:
+    """
+    從 yfinance 開源套件抓取單一標的即時報價與財務指標；
+    嚴格追蹤每一個欄位的實際來源，若有部分欄位缺漏或異常而退回基準值，
+    於 fallback_fields 與 source 中明確標示「HYBRID (部分備援)」，絕不混充全即時數據。
+    """
+    result: Dict[str, Any] = {
         "price": stock.fallback_price,
         "high52": stock.fallback_high52,
         "low52": stock.fallback_low52,
         "ttm_eps": stock.fallback_ttm_eps,
         "forward_eps": stock.fallback_forward_eps,
         "fcf_per_share": stock.fallback_fcf_per_share,
-        "source": "BASELINE (基準備援)",
+        "source": "BASELINE (離線基準快照)",
+        "fallback_fields": ["股價", "52W高點", "52W低點", "GAAP_EPS", "Forward_EPS", "FCF/Share"],
+        "sec_edgar_eps": None,
     }
+
+    if use_sec_edgar and not use_offline and stock.cik:
+        sec_data = fetch_sec_edgar_eps(stock.cik)
+        if sec_data:
+            result["sec_edgar_eps"] = sec_data
 
     if use_offline or not HAS_YFINANCE:
         return result
+
+    fx_map = fx_to_usd or {"TWD": 1.0 / 32.0, "EUR": 1.09, "JPY": 1.0 / 150.0, "GBP": 1.28}
+    fb_fields: List[str] = []
 
     try:
         tk = yf.Ticker(stock.ticker)
@@ -349,45 +414,70 @@ def fetch_live_stock_metrics(stock: StockBaseline, use_offline: bool = False) ->
         live_forward_eps = info.get("forwardEps")
 
         free_cf = info.get("freeCashflow")
-        shares = info.get("sharesOutstanding") or info.get("impliedSharesOutstanding")
+        # 關鍵修正：針對雙重股權結構公司（如 GOOGL A+B+C 股），優先使用 impliedSharesOutstanding 總稀釋股數，避免僅除單一類別股數導致每股 FCF 虛胖翻倍
+        imp_shares = info.get("impliedSharesOutstanding")
+        ord_shares = info.get("sharesOutstanding")
+        if isinstance(imp_shares, (int, float)) and isinstance(ord_shares, (int, float)):
+            shares = max(float(imp_shares), float(ord_shares))
+        else:
+            shares = imp_shares or ord_shares
+
         fin_currency = (info.get("financialCurrency") or "USD").upper()
         quote_currency = (info.get("currency") or "USD").upper()
 
         live_fcf_ps = None
         if isinstance(free_cf, (int, float)) and isinstance(shares, (int, float)) and shares > 0:
             raw_fcf_ps = float(free_cf) / float(shares)
-            # 修正跨國 ADR 財報幣別錯配問題（例如 TSM 財報為 TWD、ASML 財報為 EUR，但股價與 EPS 為 USD）
             if fin_currency != quote_currency and quote_currency == "USD":
-                fx_to_usd = {
-                    "TWD": 1.0 / 32.0,  # 新台幣兌美元近似匯率
-                    "EUR": 1.09,        # 歐元兌美元近似匯率
-                    "JPY": 1.0 / 150.0,
-                    "GBP": 1.28,
-                }
-                rate = fx_to_usd.get(fin_currency)
+                rate = fx_map.get(fin_currency)
                 if rate is not None:
                     raw_fcf_ps *= rate
                 else:
-                    # 若遇到未知外幣財報，退回使用已驗證之美元備援 FCF/Share
-                    raw_fcf_ps = stock.fallback_fcf_per_share
-            live_fcf_ps = raw_fcf_ps
+                    raw_fcf_ps = None
+            # 異常值防護：若拆股調整未同步或口徑差異導致即時 FCF/Share 超過預估盈餘與基準值的 1.75 倍，退回經過驗證之基準 FCF/Share
+            ref_anchor = max(stock.fallback_fcf_per_share, stock.fallback_forward_eps)
+            if raw_fcf_ps is not None and 0 < raw_fcf_ps <= ref_anchor * 1.75:
+                live_fcf_ps = raw_fcf_ps
 
         if isinstance(live_price, (int, float)) and live_price > 0:
             result["price"] = round(float(live_price), 2)
-            result["source"] = "LIVE (yfinance)"
+        else:
+            fb_fields.append("股價")
+
         if isinstance(live_high52, (int, float)) and live_high52 > 0:
             result["high52"] = round(float(live_high52), 2)
+        else:
+            fb_fields.append("52W高點")
+
         if isinstance(live_low52, (int, float)) and live_low52 > 0:
             result["low52"] = round(float(live_low52), 2)
+        else:
+            fb_fields.append("52W低點")
+
         if isinstance(live_ttm_eps, (int, float)) and live_ttm_eps > 0:
             result["ttm_eps"] = round(float(live_ttm_eps), 2)
+        else:
+            fb_fields.append("GAAP_EPS")
+
         if isinstance(live_forward_eps, (int, float)) and live_forward_eps > 0:
             result["forward_eps"] = round(float(live_forward_eps), 2)
+        else:
+            fb_fields.append("Forward_EPS")
+
         if isinstance(live_fcf_ps, (int, float)) and live_fcf_ps > 0:
             result["fcf_per_share"] = round(float(live_fcf_ps), 2)
+        else:
+            fb_fields.append("FCF/Share")
+
+        result["fallback_fields"] = fb_fields
+        if len(fb_fields) == 0:
+            result["source"] = "LIVE (yfinance 全欄位即時)"
+        elif len(fb_fields) < 6:
+            result["source"] = f"HYBRID (即時報價 + 備援:{'/'.join(fb_fields)})"
+        else:
+            result["source"] = "BASELINE (離線基準快照)"
 
     except Exception:
-        # 發生任何網路或解析錯誤時，保持使用備援數據，確保系統永不中斷
         pass
 
     return result
@@ -425,14 +515,13 @@ def evaluate_signal(current_price: float, target_price: float, near_threshold: f
 
 
 def analyze_stock(stock: StockBaseline, metrics: Dict[str, Any], cfg: ValuationConfig) -> ValuationResult:
-    """執行單一標的之三軌估值計算、策略適配與方法論盲點診斷"""
+    """執行單一標的之三軌估值計算、同源訊號去重、價值陷阱防禦鎖與方法論盲點診斷"""
     # 處理 ORCL 基準年 2019 (規格書原始 CAGR 12.96% 為 N=5 區間驗證值)
     if stock.ticker == "ORCL" and stock.base_year == 2019:
         years_n = 5
     else:
         years_n = max(1, cfg.latest_fy_year - stock.base_year)
 
-    # 採用規格書驗證 CAGR（亦可由公式驗算，兩者一致）
     calc_cagr = calculate_cagr(stock.base_eps, stock.eps_2025, years_n)
     cagr_pct = round(calc_cagr, 2) if abs(calc_cagr - stock.raw_cagr) < 0.05 else stock.raw_cagr
 
@@ -449,6 +538,7 @@ def analyze_stock(stock: StockBaseline, metrics: Dict[str, Any], cfg: ValuationC
     gaap_eps = float(metrics["ttm_eps"])
     fwd_eps = float(metrics["forward_eps"])
     fcf_ps = float(metrics["fcf_per_share"])
+    fb_fields: List[str] = list(metrics.get("fallback_fields", []))
 
     # 【策略一】GAAP 基本面 PEG 7 折目標價
     s1_ideal = gaap_eps * capped_pe
@@ -482,16 +572,22 @@ def analyze_stock(stock: StockBaseline, metrics: Dict[str, Any], cfg: ValuationC
     # ==========================================================================
     notes: List[str] = []
 
+    # 0. 資料來源透明度與 SEC EDGAR 驗證提示
+    if fb_fields and "BASELINE" not in str(metrics.get("source", "")):
+        notes.append(f"📡 欄位透明揭露：即時報價連線成功，惟 [{', '.join(fb_fields)}] 欄位因來源缺漏或異常防呆，自動採用驗證基準值")
+    sec_eps_map = metrics.get("sec_edgar_eps")
+    if isinstance(sec_eps_map, dict) and sec_eps_map:
+        latest_sec_fy = max(sec_eps_map.keys())
+        notes.append(f"🏛️ SEC EDGAR 官方 10-K 年報驗證：FY{latest_sec_fy} 官方 Diluted EPS 為 ${sec_eps_map[latest_sec_fy]:.2f}")
+
     # 1. 決定該標的之「推薦主策略 (Recommended Anchor)」
     if stock.sector_type == "SAAS_SBC":
-        # 高 SBC 軟體股：策略一嚴重失真，優先看策略三（真實獲利）或策略二（高點回檔）
         if cagr_pct >= 25.0:
             rec_strategy = "策略三 (Forward/FCF)"
             rec_target = s3_target
             rec_diff = s3_diff
             rec_sig = s3_sig
         else:
-            # 成長率趨緩之成熟 SaaS (如 CRM, INTU, ADBE)，PEG 偏低，結合策略三與策略二較高者或策略二
             rec_strategy = "策略二/三 雙軌定錨"
             rec_target = max(s2_target, s3_target) if s2_valid else s3_target
             rec_sig, rec_diff = evaluate_signal(price, rec_target, cfg.near_target_threshold)
@@ -499,21 +595,18 @@ def analyze_stock(stock: StockBaseline, metrics: Dict[str, Any], cfg: ValuationC
         if sbc_ratio >= 1.5:
             notes.append(f"SBC 扭曲顯著：真實獲利基數 (${true_profit_base:.2f}) 為帳面 GAAP EPS (${gaap_eps:.2f}) 的 {sbc_ratio:.1f} 倍，切勿單看策略一")
     elif stock.sector_type == "MATURE_MOAT":
-        # 超級權值護城河或成熟收息顧問股 (MSFT, AAPL, IBM, ACN)：純歷史 CAGR 偏低導致 PEG 目標價永久踏空
         rec_strategy = "策略二 (52W高點7折)"
         rec_target = s2_target
         rec_diff = s2_diff
         rec_sig = s2_sig
         notes.append(f"成熟高護城河溢價：歷史 CAGR ({cagr_pct:.1f}%) 偏溫和，純基本面 PEG 目標價 (${s1_target:.1f}) 易導致永久踏空，宜採策略二回檔分批布局")
     elif stock.sector_type == "SEMI_EQUIP":
-        # 半導體設備週期股 (ASML, AMAT, LRCX, KLAC)：須防範景氣循環高峰與深跌陷阱
         rec_strategy = "策略一/三 + 週期檢核"
         rec_target = s3_target
         rec_diff = s3_diff
         rec_sig = s3_sig
         notes.append("半導體設備具景氣循環特性：高峰期 EPS 與高點回檔需搭配晶圓廠資本支出 (Capex) 週期綜合判斷")
     else:
-        # AI 算力硬體與雲端巨頭 (GOOGL, NVDA, AMZN, TSM, AVGO, NFLX, META, ORCL)
         rec_strategy = "策略一/三 (基本面PEG)"
         rec_target = s1_target if (gaap_eps / true_profit_base) >= 0.85 else s3_target
         rec_sig, rec_diff = evaluate_signal(price, rec_target, cfg.near_target_threshold)
@@ -522,37 +615,60 @@ def analyze_stock(stock: StockBaseline, metrics: Dict[str, Any], cfg: ValuationC
     if cagr_pct > cfg.max_pe_cap:
         notes.append(f"啟動 PE 封頂保護：原始 CAGR 高達 {cagr_pct:.1f}%，已強制鎖定上限 {cfg.max_pe_cap:.0f} 倍（7折後 {discounted_pe:.1f} 倍 PE）避免天價估值")
 
-    # 3. 診斷高點深度回撤（防止盲目接刀 / 價值陷阱）
+    # 3. 診斷高點深度回撤與價值陷阱防禦鎖（防止盲目接刀）
+    is_earnings_contracting = gaap_eps < stock.eps_2025 * 0.80
+    is_deep_drawdown = drawdown_pct <= -40.0
     if drawdown_pct <= -35.0:
         notes.append(f"⚠️ 深度回撤警示：現價已自 52 週高點回檔達 {drawdown_pct:.1f}%（跌破策略二 7 折線），進場前須確認基本面是否遭 AI 顛覆或指引下修")
 
     # 4. 診斷盈餘成長動能變化 (TTM EPS vs 2025 EPS)
     if gaap_eps >= stock.eps_2025 * 1.25:
         notes.append(f"🔥 盈餘動能強勁：當期 TTM EPS (${gaap_eps:.2f}) 較 2025 基準 (${stock.eps_2025:.2f}) 成長逾 +{(gaap_eps/stock.eps_2025 - 1)*100:.0f}%，推升基本面安全墊")
-    elif gaap_eps < stock.eps_2025 * 0.80:
-        notes.append(f"⚠️ 帳面盈餘衰退或重組：當期 TTM EPS (${gaap_eps:.2f}) 低於 2025 基準 (${stock.eps_2025:.2f})，請改以策略三 ({best_source}) 評估")
+    elif is_earnings_contracting:
+        notes.append(f"⚠️ 帳面盈餘衰退或重組：當期 TTM EPS (${gaap_eps:.2f}) 低於 2025 基準 (${stock.eps_2025:.2f})，請改以策略三 ({best_source}) 評估並留意價值陷阱")
 
-    # 5. 綜合燈號判定與「一二三軌金字塔分批投入資金 %」計算
-    triggered_buys = []
-    if s1_sig == "BUY":
-        triggered_buys.append("策略一")
-    if s2_sig == "BUY" and s2_valid:
-        triggered_buys.append("策略二")
-    if s3_sig == "BUY":
-        triggered_buys.append("策略三")
+    # 5. 綜合燈號判定、「同源訊號去重」與「一二三軌金字塔分批投入資金 %」計算
+    s1_buy = (s1_sig == "BUY")
+    s2_buy = (s2_sig == "BUY" and s2_valid)
+    s3_buy = (s3_sig == "BUY")
+
+    # 關鍵修正：同源訊號去重保護（若策略一與策略三目標價差距 < 3%，代表兩者使用相同或幾乎相同的獲利基數，在未觸發策略二時合併視為 1 軌基本面訊號，避免虛增至 60% 倉位）
+    same_fundamental_base = abs(s3_target - s1_target) / max(1.0, s1_target) < 0.03
+    triggered_buys: List[str] = []
+    if s1_buy and s3_buy and same_fundamental_base and not s2_buy:
+        triggered_buys.append("策略一/三(同源獲利)")
+        notes.append(f"📌 同源訊號去重保護：策略一 (${s1_target:.2f}) 與策略三 (${s3_target:.2f}) 採計極相近之獲利基數，合併計為 1 軌獨立基本面訊號，避免重複加權")
+    else:
+        if s1_buy:
+            triggered_buys.append("策略一")
+        if s2_buy:
+            triggered_buys.append("策略二")
+        if s3_buy:
+            triggered_buys.append("策略三")
 
     matched_cnt = len(triggered_buys)
     any_near = (s1_sig == "NEAR") or (s3_sig == "NEAR") or (s2_sig == "NEAR" and s2_valid)
 
+    # 價值陷阱防禦鎖：若雖然觸發 2~3 軌，但當期盈餘嚴重衰退或深度崩跌超過 45%，強制鎖定試單上限 30%
+    circuit_breaker_triggered = (matched_cnt >= 2) and (is_earnings_contracting or drawdown_pct <= -45.0)
+    if circuit_breaker_triggered:
+        notes.append("🛡️ 觸發【價值陷阱防禦鎖】：雖多軌價格達標，但因盈餘衰退或深度破底，系統強制將建議投入上限鎖定為 30% 試單倉（佔總資產 1.5%），待下季財報止穩再解鎖加碼")
+
     if matched_cnt == 3:
-        overall_signal = f"🔥 3軌全滿 ({'/'.join(triggered_buys)})"
-        alloc_suggest = "🔥 投入 100% 滿倉 (三軌全滿重倉區)"
+        overall_signal = f"🔥 3軌全滿 ({'/'.join(triggered_buys)})" if not circuit_breaker_triggered else f"⚠️ 3軌觸發但啟動防禦鎖 ({'/'.join(triggered_buys)})"
+        if circuit_breaker_triggered:
+            alloc_suggest = "🛡️ 鎖定單股額度 30% (價值陷阱防禦鎖啟動)"
+        else:
+            alloc_suggest = "🔥 投入單股額度 100% (佔總資產上限 5%)"
     elif matched_cnt == 2:
-        overall_signal = f"🟢🟢 2軌達標 ({'/'.join(triggered_buys)})"
-        alloc_suggest = "🟢 投入 60% 資金 (雙軌確認加碼區)"
+        overall_signal = f"🟢🟢 2軌達標 ({'/'.join(triggered_buys)})" if not circuit_breaker_triggered else f"⚠️ 2軌觸發但啟動防禦鎖 ({'/'.join(triggered_buys)})"
+        if circuit_breaker_triggered:
+            alloc_suggest = "🛡️ 鎖定單股額度 30% (價值陷阱防禦鎖啟動)"
+        else:
+            alloc_suggest = "🟢🟢 投入單股額度 60% (佔總資產 3%)"
     elif matched_cnt == 1:
         overall_signal = f"🟢 1軌達標 ({triggered_buys[0]})"
-        alloc_suggest = "🟢 投入 30% 資金 (單軌試單基本倉)"
+        alloc_suggest = "🟢 投入單股額度 30% (佔總資產 1.5%)"
     elif any_near:
         triggered_nears = []
         if s1_sig == "NEAR":
@@ -567,7 +683,6 @@ def analyze_stock(stock: StockBaseline, metrics: Dict[str, Any], cfg: ValuationC
         overall_signal = "⚪ 觀望等待"
         alloc_suggest = "⚪ 0% (續抱底倉/SHV領息)"
 
-    # 計算 10 折合理價值賣出價 (回測停利標準：7折目標價 / 0.70 = 10折理想價，較7折買點高出 +42.86%)
     fair_sell_100 = (rec_target / cfg.safety_discount) if cfg.safety_discount > 0 else rec_target * 1.4286
     overheated_sell_120 = fair_sell_100 * 1.20
 
@@ -576,7 +691,7 @@ def analyze_stock(stock: StockBaseline, metrics: Dict[str, Any], cfg: ValuationC
         name=stock.name,
         category=stock.category,
         sector_type=stock.sector_type,
-        data_source=metrics["source"],
+        data_source=metrics.get("source", metrics.get("data_source", "LIVE")),
         base_year=stock.base_year,
         base_eps=stock.base_eps,
         eps_2025=stock.eps_2025,
@@ -616,6 +731,8 @@ def analyze_stock(stock: StockBaseline, metrics: Dict[str, Any], cfg: ValuationC
         current_true_pe=round(current_true_pe, 2),
         current_peg_true=round(current_peg_true, 2),
         drawdown_from_high_pct=round(drawdown_pct, 2),
+        circuit_breaker_triggered=circuit_breaker_triggered,
+        fallback_fields=fb_fields,
         diagnostic_notes=notes,
     )
 
@@ -625,7 +742,6 @@ def analyze_stock(stock: StockBaseline, metrics: Dict[str, Any], cfg: ValuationC
 # ==============================================================================
 def print_terminal_report(results: List[ValuationResult], cfg: ValuationConfig) -> None:
     """在終端機印出結構化三軌估值監控對照表與訊號摘要"""
-    # 確保 Windows 終端機能正常印出 UTF-8 與 Emoji
     if hasattr(sys.stdout, "reconfigure"):
         try:
             sys.stdout.reconfigure(encoding="utf-8")
@@ -677,9 +793,9 @@ def print_terminal_report(results: List[ValuationResult], cfg: ValuationConfig) 
 
     print("=" * 136)
     print(f"📌 【每週巡檢與一二三軌金字塔資金投入摘要】共追蹤 {len(results)} 檔 AI 權值巨頭：")
-    print(f"   🔥 3軌全滿（投入 100% 大量資金 / 股災黃金坑）：共 {len(three_tracks)} 檔 -> {', '.join(three_tracks) if three_tracks else '無'}")
-    print(f"   🟢🟢 2軌滿足（投入 60% 主力資金）：共 {len(two_tracks)} 檔 -> {', '.join(two_tracks) if two_tracks else '無'}")
-    print(f"   🟢 1軌滿足（投入 30% 基本試單資金）：共 {len(one_track)} 檔 -> {', '.join(one_track) if one_track else '無'}")
+    print(f"   🔥 3軌全滿（投入單股額度 100% / 佔總資產上限 5%）：共 {len(three_tracks)} 檔 -> {', '.join(three_tracks) if three_tracks else '無'}")
+    print(f"   🟢🟢 2軌滿足（投入單股額度 60% / 佔總資產 3%）：共 {len(two_tracks)} 檔 -> {', '.join(two_tracks) if two_tracks else '無'}")
+    print(f"   🟢 1軌滿足（投入單股額度 30% / 佔總資產 1.5%）：共 {len(one_track)} 檔 -> {', '.join(one_track) if one_track else '無'}")
     print(f"   🟡 接近目標預警（距離目標價 +{cfg.near_target_threshold*100:.0f}% 內，SHV短債待命）：共 {len(near_list)} 檔 -> {', '.join(x.ticker for x in near_list) if near_list else '無'}")
     print("=" * 136)
 
@@ -687,8 +803,8 @@ def print_terminal_report(results: List[ValuationResult], cfg: ValuationConfig) 
 def export_csv_report(results: List[ValuationResult], output_path: Path) -> None:
     """匯出 UTF-8 with BOM 格式之全中文欄位 CSV 報表，支援 Excel 直接開啟不亂碼"""
     fieldnames = [
-        "股票代號 (Ticker)", "公司名稱 (Name)", "產業分類與所屬指數", "資料來源",
-        "滿足策略軌數 (0~3軌)", "建議投入資金比例 (%)", "綜合監控燈號",
+        "股票代號 (Ticker)", "公司名稱 (Name)", "產業分類與所屬指數", "資料來源與欄位透明度",
+        "滿足獨立策略軌數 (0~3軌)", "建議投入單股額度比例 (%)", "綜合監控燈號",
         "目前股價 ($)", "推薦最適主策略", "🟢 推薦7折買進目標價 ($)", "與7折買進價差距 (%)",
         "🎯 10折合理賣出價 (回測停利點 +42.9%)", "🔥 12折過熱減碼價 (+71.4%)",
         "【策略一】GAAP帳面7折買進價 ($)", "策略一差距 (%)", "策略一訊號",
@@ -710,9 +826,9 @@ def export_csv_report(results: List[ValuationResult], output_path: Path) -> None
                 "股票代號 (Ticker)": r.ticker,
                 "公司名稱 (Name)": r.name,
                 "產業分類與所屬指數": r.category,
-                "資料來源": r.data_source,
-                "滿足策略軌數 (0~3軌)": f"{r.matched_tracks_count} 軌滿足",
-                "建議投入資金比例 (%)": r.alloc_pct_suggestion,
+                "資料來源與欄位透明度": r.data_source,
+                "滿足獨立策略軌數 (0~3軌)": f"{r.matched_tracks_count} 軌滿足",
+                "建議投入單股額度比例 (%)": r.alloc_pct_suggestion,
                 "綜合監控燈號": r.overall_signal,
                 "目前股價 ($)": r.current_price,
                 "推薦最適主策略": r.recommended_strategy,
@@ -748,12 +864,22 @@ def export_csv_report(results: List[ValuationResult], output_path: Path) -> None
             })
 
 
-def _load_backtest_data_for_dashboard() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """載入近五年回測之個股統計與交易範例明細，以內嵌於主儀表板之『賣股指南與回測範例驗證頁』"""
+def _load_backtest_data_for_dashboard() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+    """載入近五年無前視偏差 (Point-in-Time) 回測之個股統計、交易範例明細與總體績效元資料"""
     summary_rows: List[Dict[str, Any]] = []
     trade_rows: List[Dict[str, Any]] = []
+    meta_dict: Dict[str, Any] = {
+        "smart_portfolio_return_pct": 389.1,
+        "smart_portfolio_cagr_pct": 37.5,
+        "smart_portfolio_win_rate_pct": 90.0,
+        "avg_staged_3tier_return_pct": 268.1,
+        "avg_hold_from_entry_return_pct": 344.5,
+        "spy_return_pct": 82.2,
+        "qqq_return_pct": 96.0,
+    }
     sum_path = Path("peg_backtest_report.csv")
     tr_path = Path("peg_backtest_trades.csv")
+    meta_path = Path("peg_backtest_meta.json")
     if sum_path.exists():
         try:
             with sum_path.open("r", encoding="utf-8-sig") as f:
@@ -766,26 +892,33 @@ def _load_backtest_data_for_dashboard() -> Tuple[List[Dict[str, Any]], List[Dict
                 trade_rows = list(csv.DictReader(f))
         except Exception:
             pass
-    return summary_rows, trade_rows
+    if meta_path.exists():
+        try:
+            meta_dict.update(json.loads(meta_path.read_text(encoding="utf-8")))
+        except Exception:
+            pass
+    return summary_rows, trade_rows, meta_dict
 
 
-def export_html_dashboard(results: List[ValuationResult], cfg: ValuationConfig, output_path: Path) -> None:
+def export_html_dashboard(
+    results: List[ValuationResult],
+    cfg: ValuationConfig,
+    output_path: Path,
+    market_ctx: Optional[Dict[str, Any]] = None,
+) -> None:
     """
     生成防遺忘、全中文說明、頂級 FinTech 視覺設計之單檔互動式網頁儀表板 (peg_valuation_dashboard.html)
-    包含五大核心頁籤與深淺色主題切換：
-    1. 📖 【主頁面：我的投資憲法與 50/50 配置總覽】（含每週 3 分鐘巡檢 SOP、資料來源可靠度說明、CSPX/BND/SHV/QQQ 配置理由、1/2/3軌金字塔視覺卡、全中文指標字典）
-    2. 📊 【每週巡檢：22 檔三軌買賣價監控表】（含 52 週股價區間視覺尺、滿足幾軌能量條、建議投入資金%、7折買進價、10折合理賣出價、12折過熱減碼價）
-    3. ⚖️ 【賣股時機判斷指南 ＆ 五年回測範例驗證頁】（解釋賣股數值理由 + 22檔買賣目標價對照 + 50筆歷史真實回測交易範例留存驗證）
-    4. 💼 【50/50 雙軌資產配置與 SVG 視覺化試算器】（依 CSPX / BND / SHV / QQQ 與 1/2/3 軌達標個股自動計算下單金額與動態圓餅圖）
-    5. 🧮 【方法論利弊深度剖析 ＆ 自訂美股 PEG 7 折試算器】
     """
     now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    live_count = sum(1 for r in results if "LIVE" in r.data_source)
+    live_count = sum(1 for r in results if "LIVE" in r.data_source or "HYBRID" in r.data_source)
+    full_live_count = sum(1 for r in results if "LIVE (" in r.data_source)
+    shv_yield = (market_ctx or {}).get("shv_yield_pct", 4.65)
     data_json = json.dumps([asdict(r) for r in results], ensure_ascii=False)
     cfg_json = json.dumps(asdict(cfg), ensure_ascii=False)
-    bt_summaries, bt_trades = _load_backtest_data_for_dashboard()
+    bt_summaries, bt_trades, bt_meta = _load_backtest_data_for_dashboard()
     bt_sum_json = json.dumps(bt_summaries, ensure_ascii=False)
     bt_tr_json = json.dumps(bt_trades, ensure_ascii=False)
+    bt_meta_json = json.dumps(bt_meta, ensure_ascii=False)
 
     html_content = f"""<!DOCTYPE html>
 <html lang="zh-TW" data-theme="dark">
@@ -1057,7 +1190,7 @@ def export_html_dashboard(results: List[ValuationResult], cfg: ValuationConfig, 
   }}
   .pyramid-step .step-pct {{
     font-family: var(--font-mono);
-    font-size: 1.65rem;
+    font-size: 1.55rem;
     font-weight: 800;
     margin-bottom: 4px;
   }}
@@ -1466,13 +1599,13 @@ def export_html_dashboard(results: List[ValuationResult], cfg: ValuationConfig, 
       <div class="brand-logo">🛡️</div>
       <div class="brand-title">
         <h1>我的美股 50/50 雙軌資產配置 ＆「PEG 7 折三軌監控系統」私人財富終端</h1>
-        <p>防遺忘投資憲法：50% 核心底倉 (CSPX 省稅大盤 + BND 債券防守) ＋ 50% 衛星狙擊倉 (SHV 短債停泊 + 22 檔巨頭 1/2/3 軌買進 & QQQ 股災抄底)</p>
+        <p>防遺忘投資憲法：50% 核心底倉 (CSPX 35% 省稅大盤 + BND 15% 債券防守) ＋ 50% 衛星狙擊倉 (SHV 短債停泊 + 22 檔巨頭 1/2/3 軌買進 & QQQ 股災抄底)</p>
       </div>
     </div>
     <div class="status-cluster">
-      <div class="status-pill" title="透過 Yahoo Finance API 即時抓取最新股價、52週高低點、GAAP EPS、Forward EPS 與自由現金流">
+      <div class="status-pill" title="透過 yfinance 擷取 Yahoo Finance 公開市場行情，並提供逐欄備援透明標記與 SEC EDGAR 10-K 驗證">
         <span class="pulse-dot"></span>
-        <span>資料源：<strong>Yahoo Finance API ({live_count}/{len(results)} 即時連線)</strong></span>
+        <span>資料源：<strong>yfinance 公開行情 ({live_count}/{len(results)} 連線｜{full_live_count} 全欄即時)</strong></span>
       </div>
       <div class="status-pill mono-num">⏱️ 更新：{now_str}</div>
       <button class="theme-toggle-btn" onclick="toggleTheme()" id="theme-btn">☀️ 切換淺色晨報</button>
@@ -1485,86 +1618,86 @@ def export_html_dashboard(results: List[ValuationResult], cfg: ValuationConfig, 
   <nav class="tabs-wrapper">
     <button class="tab-btn active" onclick="switchTab('tab-home', this)">📖 1. 我的投資憲法與每週 SOP (防遺忘主頁)</button>
     <button class="tab-btn" onclick="switchTab('tab-monitor', this)">📊 2. 每週巡檢：22 檔三軌買賣價雷達</button>
-    <button class="tab-btn" onclick="switchTab('tab-sell-guide', this)">⚖️ 3. 賣股時機判斷 ＆ 五年回測範例驗證</button>
+    <button class="tab-btn" onclick="switchTab('tab-sell-guide', this)">⚖️ 3. 賣股時機判斷 ＆ 無前視偏差回測驗證</button>
     <button class="tab-btn" onclick="switchTab('tab-allocation', this)">💼 4. 50/50 視覺化配置與下單試算器</button>
     <button class="tab-btn" onclick="switchTab('tab-calculator', this)">🧮 5. 方法論利弊 ＆ 自訂美股試算</button>
   </nav>
 
   <!-- ===================================================================== -->
-  <!-- TAB 1: 防遺忘主頁面 (我的投資憲法、每週巡檢 SOP、資料來源可靠度、1/2/3軌法則、全中文指標字典) -->
+  <!-- TAB 1: 防遺忘主頁面 -->
   <!-- ===================================================================== -->
   <div id="tab-home" class="tab-panel active">
     <div class="playbook-hero">
       <div>
         <h2>📌 給未來的自己：為什麼我設計這套「50 / 50 雙軌配置 ＋ PEG 7 折三軌系統」？</h2>
         <p>
-          這套系統融合了《全球布局與美股投資地圖》的四大指數思維與量化安全邊際。<strong>核心原則是「50% 核心避險底倉 ： 50% 衛星打折狙擊倉」</strong>——
-          平時不單押高波動科技股，靠 50% 底倉（愛爾蘭省稅標普 500 <strong>CSPX</strong> ＋ 總體債券 <strong>BND</strong>）穩健避險與參與國運；另外 50% 停泊在短期美債 <strong>SHV</strong> 領息當彈藥庫，
-          透過<strong>每週觀察一次</strong>（特別在市場恐慌或股災來臨時），依照下方<strong>「滿足 1 軌投 30%、滿足 2 軌投 60%、3 軌全滿重倉 100% + 抄底 QQQ」</strong>的金字塔紀律分批買進優質好股並長期持有！
+          這套系統融合了《全球布局與美股投資地圖》的四大指數思維與量化安全邊際。<strong>核心原則是「50% 核心避險底倉（35% CSPX + 15% BND）： 50% 衛星打折狙擊倉」</strong>——
+          平時不單押高波動科技股，靠 50% 底倉穩健避險與參與國運；另外 50% 停泊在短期美債 <strong>SHV（目前年化殖利率約 {shv_yield:.2f}%）</strong> 領息當彈藥庫，
+          透過<strong>每週觀察一次</strong>，依照下方<strong>「滿足 1 軌投單股額度 30%、滿足 2 軌投 60%、3 軌全滿投滿 100%（單一股票上限佔總資產 5%）+ 抄底 QQQ」</strong>的金字塔紀律分批買進優質好股！
         </p>
         <!-- 金字塔分批建倉視覺化階梯卡 -->
         <div class="pyramid-grid">
           <div class="pyramid-step">
             <span class="step-tag" style="background:rgba(148,163,184,0.18);color:var(--text-muted);">⚪ 0 軌滿足｜平時高點</span>
-            <div class="step-pct" style="color:var(--text-muted);">投入 0%</div>
-            <div class="step-desc">股價高於所有 7 折線，資金停泊於 <strong>SHV 短債</strong> 領取 4~5% 美元利息，絕不追高。</div>
+            <div class="step-pct" style="color:var(--text-muted);">單股額度 0%</div>
+            <div class="step-desc">股價高於所有 7 折線，資金停泊於 <strong>SHV 短債</strong> 領取約 {shv_yield:.2f}% 美元利息，絕不追高。</div>
             <div class="pyramid-bar"><div class="pyramid-bar-fill" style="width:8%;background:var(--text-muted);"></div></div>
           </div>
           <div class="pyramid-step">
-            <span class="step-tag" style="background:rgba(56,189,248,0.16);color:var(--accent-cyan);">🟢 滿足 1 個策略｜初步打折</span>
-            <div class="step-pct" style="color:var(--accent-cyan);">投入 30%</div>
-            <div class="step-desc">單一軌道率先跌破 7 折價，先投入該股目標額度的 <strong>30% 基本試單倉</strong>，確保不踏空。</div>
+            <span class="step-tag" style="background:rgba(56,189,248,0.16);color:var(--accent-cyan);">🟢 滿足 1 軌｜初步打折</span>
+            <div class="step-pct" style="color:var(--accent-cyan);">單股額度 30%</div>
+            <div class="step-desc">單一獨立軌道跌破 7 折價，投入該股目標額度的 <strong>30%（佔總資產 1.5%）</strong> 基本試單倉，確保不踏空。</div>
             <div class="pyramid-bar"><div class="pyramid-bar-fill" style="width:30%;background:var(--accent-cyan);"></div></div>
           </div>
           <div class="pyramid-step">
-            <span class="step-tag" style="background:var(--accent-emerald-bg);color:var(--accent-emerald);">🟢🟢 滿足 2 個策略｜雙重確認</span>
-            <div class="step-pct" style="color:var(--accent-emerald);">投入 60%~70%</div>
-            <div class="step-desc">基本面與技術面/現金流兩軌同時認證打 7 折，安全邊際極高，果斷加碼至主力部位！</div>
-            <div class="pyramid-bar"><div class="pyramid-bar-fill" style="width:65%;background:var(--accent-emerald);"></div></div>
+            <span class="step-tag" style="background:var(--accent-emerald-bg);color:var(--accent-emerald);">🟢🟢 滿足 2 軌｜雙重確認</span>
+            <div class="step-pct" style="color:var(--accent-emerald);">單股額度 60%</div>
+            <div class="step-desc">兩條獨立軌道同時認證打 7 折（已排除同源重複計算），加碼至該股額度 <strong>60%（佔總資產 3%）</strong>！</div>
+            <div class="pyramid-bar"><div class="pyramid-bar-fill" style="width:60%;background:var(--accent-emerald);"></div></div>
           </div>
           <div class="pyramid-step" style="border-color:rgba(244,63,94,0.45);">
-            <span class="step-tag" style="background:var(--accent-rose-bg);color:#fda4af;">🔥 3 個策略全滿足｜股災鐵底</span>
-            <div class="step-pct" style="color:#fda4af;">投入 100% 滿倉</div>
-            <div class="step-desc">三軌全數跌破 7 折（五年回測勝率 98%），將 <strong>SHV 全數換入買滿 100% 並同步抄底 QQQ</strong>！</div>
+            <span class="step-tag" style="background:var(--accent-rose-bg);color:#fda4af;">🔥 3 軌全滿足｜股災鐵底</span>
+            <div class="step-pct" style="color:#fda4af;">單股額度 100%</div>
+            <div class="step-desc">三軌全數跌破 7 折且通過價值陷阱防禦鎖，買滿該股額度 <strong>100%（佔總資產上限 5%）並同步抄底 QQQ</strong>！</div>
             <div class="pyramid-bar"><div class="pyramid-bar-fill" style="width:100%;background:linear-gradient(90deg,#f43f5e,#f59e0b);"></div></div>
           </div>
         </div>
       </div>
 
-      <!-- 右側 SVG 50/50 雙軌配置環狀視覺圖 -->
-      <div style="text-align:center;background:var(--bg-elevated);padding:20px 24px;border-radius:16px;border:1px solid var(--border-subtle);min-width:250px;">
+      <!-- 右側 SVG 50/50 雙軌配置環狀視覺圖 (統一為 CSPX 35% + BND 15% + 衛星 50%) -->
+      <div style="text-align:center;background:var(--bg-elevated);padding:20px 24px;border-radius:16px;border:1px solid var(--border-subtle);min-width:255px;">
         <div style="font-size:0.82rem;font-weight:700;color:var(--text-muted);margin-bottom:10px;">50 / 50 核心與衛星配置藍圖</div>
         <svg width="170" height="170" viewBox="0 0 42 42" style="margin:0 auto;display:block;">
           <circle cx="21" cy="21" r="15.915" fill="transparent" stroke="rgba(148,163,184,0.15)" stroke-width="5"></circle>
-          <!-- CSPX 30% -->
-          <circle cx="21" cy="21" r="15.915" fill="transparent" stroke="#38bdf8" stroke-width="5" stroke-dasharray="30 70" stroke-dashoffset="25"></circle>
-          <!-- BND 20% -->
-          <circle cx="21" cy="21" r="15.915" fill="transparent" stroke="#c084fc" stroke-width="5" stroke-dasharray="20 80" stroke-dashoffset="-5"></circle>
+          <!-- CSPX 35% (佔核心 70%) -->
+          <circle cx="21" cy="21" r="15.915" fill="transparent" stroke="#38bdf8" stroke-width="5" stroke-dasharray="35 65" stroke-dashoffset="25"></circle>
+          <!-- BND 15% (佔核心 30%) -->
+          <circle cx="21" cy="21" r="15.915" fill="transparent" stroke="#c084fc" stroke-width="5" stroke-dasharray="15 85" stroke-dashoffset="-10"></circle>
           <!-- SHV + 1/2/3軌個股 + QQQ 50% -->
           <circle cx="21" cy="21" r="15.915" fill="transparent" stroke="#10b981" stroke-width="5" stroke-dasharray="50 50" stroke-dashoffset="-25"></circle>
           <text x="21" y="19.5" text-anchor="middle" fill="var(--text-primary)" style="font-size:5px;font-weight:800;font-family:var(--font-mono);">50 : 50</text>
           <text x="21" y="24.5" text-anchor="middle" fill="var(--text-muted)" style="font-size:2.7px;font-weight:600;">核心避險 / 衛星狙擊</text>
         </svg>
         <div style="text-align:left;font-size:0.78rem;margin-top:12px;display:grid;gap:4px;">
-          <div><span style="color:#38bdf8;">●</span> <strong>CSPX (30%)</strong>：愛爾蘭省稅標普 500</div>
-          <div><span style="color:#c084fc;">●</span> <strong>BND (20%)</strong>：美國總體債券防守倉</div>
-          <div><span style="color:#10b981;">●</span> <strong>SHV + QQQ + 22巨頭 (50%)</strong>：動態狙擊</div>
+          <div><span style="color:#38bdf8;">●</span> <strong>CSPX (總資金 35% / 核心 70%)</strong>：愛爾蘭標普 500</div>
+          <div><span style="color:#c084fc;">●</span> <strong>BND (總資金 15% / 核心 30%)</strong>：總體債券防守倉</div>
+          <div><span style="color:#10b981;">●</span> <strong>SHV + QQQ + 22巨頭 (50%)</strong>：動態狙擊倉</div>
         </div>
       </div>
     </div>
 
-    <!-- 新增：每週 3 分鐘例行巡檢 SOP ＆ 資料來源與 22 檔名單更新機制透明說明 -->
+    <!-- 每週 3 分鐘例行巡檢 SOP ＆ 資料來源誠實透明揭露 -->
     <div class="analysis-grid">
       <div class="analysis-card">
         <h3>🗓️ 每週日 3 分鐘例行觀察 SOP（可點擊打勾紀錄進度）</h3>
         <p style="font-size:0.86rem;color:var(--text-muted);margin-bottom:12px;">這套策略最棒的地方就是<strong>「不需要每天盯盤」</strong>，非常適合每週固定觀察一次（股災大跌週則可加看一次）：</p>
         <label class="checklist-item" onclick="toggleCheck(this)">
           <input type="checkbox">
-          <span><strong>步驟 1｜雙擊執行 <code>run_tracker.bat</code></strong>：花 5 秒鐘自動從 Yahoo Finance 抓取 22 檔巨頭本週最新收盤價、52 週高低點與最新財報 EPS，並自動打開本網頁。</span>
+          <span><strong>步驟 1｜雙擊執行 <code>run_tracker.bat</code></strong>：花 5 秒鐘透過 <code>yfinance</code> 抓取 22 檔巨頭本週最新收盤價、52 週高低點與最新財報 EPS，並自動打開本網頁。</span>
         </label>
         <label class="checklist-item" onclick="toggleCheck(this)">
           <input type="checkbox">
-          <span><strong>步驟 2｜切換到「📊 分頁 2：每週巡檢表」看頂部 4 張燈號卡</strong>：檢查本週是否有股票進入「🔥 3 軌全滿（投 100%）」或「🟢🟢 2 軌滿足（投 60%）」或「🟢 1 軌滿足（投 30%）」。</span>
+          <span><strong>步驟 2｜切換到「📊 分頁 2：每週巡檢表」看頂部 4 張燈號卡</strong>：檢查本週是否有股票進入「🔥 3 軌全滿（投單股額度 100%，佔總資產 5%）」或「🟢🟢 2 軌滿足（投單股額度 60%）」或「🟢 1 軌滿足（投單股額度 30%）」。</span>
         </label>
         <label class="checklist-item" onclick="toggleCheck(this)">
           <input type="checkbox">
@@ -1579,17 +1712,17 @@ def export_html_dashboard(results: List[ValuationResult], cfg: ValuationConfig, 
       <div class="analysis-card">
         <h3>🔍 這些股票的資料從哪裡取得？是否可靠？22 檔名單是固定的嗎？</h3>
         <div class="rule-box green">
-          <h4>1. 資料來源與可靠度：雙重官方級財經數據源（Yahoo Finance API ＋ SEC EDGAR）</h4>
+          <h4>1. 資料來源與誠實可靠度揭露（yfinance 開源套件 ＋ 逐欄備援透明標記 ＋ SEC EDGAR）</h4>
           <p>
-            • <strong>即時連線抓取（每次執行自動更新 6 大指標）</strong>：程式透過 <code>yfinance</code> 套件直接連線 <strong>Yahoo Finance 官方財經 API</strong>（其底層美股財報與共識預估整合自 <strong>S&P Global Market Intelligence / Capital IQ、Refinitiv / LSEG 與 Morningstar</strong>）。每次打開都會即時更新：<strong>① 最新股價、② 52 週最高價、③ 52 週最低價、④ 過去 12 個月帳面盈餘 (GAAP TTM EPS)、⑤ 華爾街外資預估遠期盈餘 (Forward EPS)、⑥ 每股自由現金流 (FCF/Share，含台積電 TSM 新台幣與 ASML 歐元財報自動匯率校正)</strong>。<br>
-            • <strong>美國證管會官方年報驗證（SEC EDGAR）</strong>：內建美國證管會 <code>data.sec.gov</code> 10-K 官方年報 CIK 查詢支援，且當網路斷線時具備<strong>離線備援機制（Fallback）</strong>，確保高度可靠且永不當機。
+            • <strong>即時連線抓取（每次執行自動更新 6 大指標）</strong>：程式透過開源社群套件 <code>yfinance</code> 擷取 <strong>Yahoo Finance 公開市場行情</strong>，每次打開即時更新：<strong>① 最新股價、② 52 週最高價、③ 52 週最低價、④ 過去 12 個月帳面盈餘 (GAAP TTM EPS)、⑤ 分析師預估遠期盈餘 (Forward EPS)、⑥ 每股自由現金流 (FCF/Share，含雙重股權總股數修正與即時匯率換算)</strong>。<br>
+            • <strong>逐欄備援透明揭露（絕不黑箱混充）</strong>：若某檔股票因拆股未同步或欄位缺漏而退回基準值，表格上會明確標示 <code>🟡 部分備援:[欄位名稱]</code>；並支援指令 <code>--sec-edgar</code> 直接連線美國證管會 <code>data.sec.gov</code> 10-K 官方年報驗證 Diluted EPS！
           </p>
         </div>
         <div class="rule-box">
           <h4>2. 這 22 檔股票是固定的，還是也會定期更新？</h4>
           <p>
-            • <strong>股價、高低點、當期 EPS、預估 EPS、自由現金流 ➔ 「每週執行時 100% 自動更新」！</strong><br>
-            • <strong>22 檔名單本身與 5 年基準成長率 (CAGR) ➔ 「核心名單穩定、支援設定檔自由擴充」</strong>：這 22 家公司是從標普 500、那斯達克 100、費半、道瓊四大指數中精選出的「最強 AI 與護城河壟斷巨頭」，龍頭地位不會每週改變，建議<strong>每年初年報公布後檢視一次</strong>即可。若您想新增第 23、24 檔股票（如 AMD、ANET、COST），可直接編輯資料夾內的 <strong><code>watchlist_config.json</code></strong>，或在本網頁「分頁 5 自訂試算器」隨時輸入代號試算！
+            • <strong>股價、高低點、當期 EPS、預估 EPS、自由現金流 ➔ 「每週執行時自動連線更新」！</strong><br>
+            • <strong>22 檔名單本身與 5 年基準成長率 (CAGR) ➔ 「核心名單穩定、支援設定檔自由擴充」</strong>：建議<strong>每年初年報公布後檢視一次</strong>即可。若想新增第 23、24 檔股票（如 AMD、ANET、COST），可直接編輯資料夾內的 <strong><code>watchlist_config.json</code></strong>，或在本網頁「分頁 5 自訂試算器」隨時輸入代號試算！
           </p>
         </div>
       </div>
@@ -1598,34 +1731,34 @@ def export_html_dashboard(results: List[ValuationResult], cfg: ValuationConfig, 
     <div class="analysis-grid">
       <!-- 左欄：50/50 資產配置與專屬 ETF 選擇理由 -->
       <div class="analysis-card">
-        <h3>🛡️ 一、我的 50 / 50 資產配置與專屬 ETF 選擇理由（省稅 ＋ 防守 ＋ 股災抄底）</h3>
+        <h3>🛡️ 一、我的 50 / 50 資產配置與專屬 ETF 選擇理由（含稅務邊界與相關性誠實備忘）</h3>
         
         <div class="rule-box">
-          <h4>1. 標普 500 大盤核心：選擇英股【CSPX】（愛爾蘭註冊 S&P 500 ETF，取代美股 VOO / SPY）</h4>
+          <h4>1. 標普 500 大盤核心（總資金 35% / 核心倉之 70%）：英股【CSPX】（取代美股 VOO / SPY）</h4>
           <p>
             • <strong>記憶提醒</strong>：我印象中的「CSCP」正式交易代號為 <strong>CSPX</strong>（iShares Core S&P 500 UCITS ETF，於倫敦交易所美元計價掛牌）。<br>
-            • <strong>為什麼不買 VOO / SPY 而買 CSPX？（省稅關鍵！）</strong>：臺灣人買美股 VOO / SPY 會被美國政府直接預扣 <strong>30% 股息稅</strong>，且若資產超過 6 萬美元還有高達 40% 的美國遺產稅風險。改買註冊在愛爾蘭的 <strong>CSPX</strong>，股息預扣稅直接<strong>減半為 15%</strong>，且為「股息自動再投資（累積型 Accumulating）」，不配發現金股利，完全免除海外股息所得稅與手動再投入的手續費！
+            • <strong>為什麼買 CSPX？（省稅關鍵！）</strong>：臺灣人買美股 VOO / SPY 會被預扣 <strong>30% 股息稅</strong>且受美國 6 萬美元遺產稅免稅額限制。改買愛爾蘭註冊的 <strong>CSPX</strong>，美股股息預扣稅<strong>減半為 15%</strong> 且為「自動再投資（累積型）」，免除海外配息所得稅並規避美國遺產稅！
           </p>
         </div>
 
         <div class="rule-box purple">
-          <h4>2. 核心防守避險部位：選擇【BND】（Vanguard 美國總體債券市場 ETF）</h4>
+          <h4>2. 核心防守避險部位（總資金 15% / 核心倉之 30%）：【BND】（美國總體債券市場 ETF）</h4>
           <p>
-            • <strong>設計理由</strong>：放在 50% 核心底倉中負責<strong>「防守與避險」</strong>。涵蓋美國政府公債與高評等投資級公司債，當遇到系統性股災、經濟衰退迫使聯準會（Fed）降息救市時，BND 能發揮抗跌與資產保護傘功能，避免整體帳戶淨值劇烈縮水。
+            • <strong>設計理由與風險備忘</strong>：負責在「經濟衰退、聯準會降息救市」時發揮抗跌保護傘功能。<strong>⚠️ 歷史風險提醒</strong>：若遇「惡性通膨＋暴力升息（如 2022 年）」，中長天期債券 BND 會出現股債雙殺；因此核心倉採「CSPX 70% : BND 30%」，另外搭配零存續期間風險的極短債 SHV。
           </p>
         </div>
 
         <div class="rule-box amber">
-          <h4>3. 衛星現金停泊彈藥庫：選擇【SHV】（iShares 1 年期以下美國極短期國庫券 ETF）</h4>
+          <h4>3. 衛星現金停泊彈藥庫：【SHV】（1 年內到期美國極短期國庫券 ETF，殖利率約 {shv_yield:.2f}%）</h4>
           <p>
-            • <strong>設計理由</strong>：放在另外 50% 衛星倉中作為<strong>「等待好股打 7 折時的現金停泊池」</strong>。因為存續期間極短（1 年內到期國庫券），股災時價格幾乎完全不跌，平時又能穩定領取約 4%~5% 美元利息；一旦每週檢查發現個股亮綠燈或股災來臨，隨時賣出 SHV 換成便宜好股！
+            • <strong>設計理由与英股替代方案</strong>：存續期間極短（< 1 年），升息或股災時本金幾乎不跌。<strong>💡 稅務進階提醒</strong>：美股 <code>SHV</code>、<code>BND</code>、<code>QQQ</code> 與 22 檔美股個股仍屬<strong>美國籍資產（US-Situs Assets）</strong>，配息預扣 30%（惟國庫券多享 QII 退稅）且計入 6 萬美元美國遺產稅額度；若未來總資金龐大想連短債與科技指數都徹底規避美國遺產稅，可將 <code>SHV</code> 替換為愛爾蘭累積型短債 <strong><code>IB01.L</code></strong>，將 <code>QQQ</code> 替換為英股 <strong><code>CNDX.L / EQQQ.L</code></strong>！
           </p>
         </div>
 
         <div class="rule-box green">
-          <h4>4. 股災來臨時的指數重砲：選擇【QQQ】（Invesco 那斯達克 100 指數 ETF）</h4>
+          <h4>4. 股災來臨時的指數重砲：【QQQ】（Invesco 那斯達克 100 指數 ETF）</h4>
           <p>
-            • <strong>設計理由</strong>：QQQ 匯集全球最強的 100 家科技創新巨頭。平時多頭高點不追高（且 QQQ 配息極低，無須擔心股息稅），但<strong>「股災來臨時（大盤自高點回檔 20%~30%），QQQ 是最佳抄底選擇」</strong>——既有科技股最強的反彈爆發力，又不必擔心單一公司倒閉風險！
+            • <strong>設計理由與重疊度提醒</strong>：平時多頭不追高，待<strong>「大盤自高點回檔 20%~30% 或 VIX > 30」</strong>時動用 SHV 抄底 QQQ。留意 CSPX 本身已含約 32% 科技權重，故衛星倉切勿在平時高點重押，嚴守「不打 7 折不出手」紀律！
           </p>
         </div>
       </div>
@@ -1644,15 +1777,15 @@ def export_html_dashboard(results: List[ValuationResult], cfg: ValuationConfig, 
         </div>
 
         <div class="rule-box green">
-          <h4>💰 每週檢查 SOP：當滿足 1 個、2 個、3 個策略時，該投入多少 % 資金？</h4>
+          <h4>💰 每週檢查 SOP：當滿足 1、2、3 軌時該投多少？（含同源去重與單股 5% 風控上限）</h4>
           <p>
-            每週打開本系統巡檢一次（平時與股災皆適用），針對單一股票的預計買進額度，嚴格執行<strong>「金字塔分批建倉」</strong>：<br><br>
-            1️⃣ <strong>【滿足 1 個策略（🟢 1軌達標）】➔ 先投入該股額度的 <span style="color:var(--accent-cyan);font-weight:700;">30% 資金</span>（基本試單倉）</strong><br>
-            &nbsp;&nbsp;&nbsp;代表股價已初步進入便宜區（例如剛從高點跌 30%，或真實現金流剛打 7 折），先買 30% 確保不踏空，若繼續跌手頭還有 70% 現金。<br><br>
-            2️⃣ <strong>【同時滿足 2 個策略（🟢🟢 2軌達標）】➔ 累計投入至 <span style="color:var(--accent-emerald);font-weight:700;">60% ~ 70% 資金</span>（主力加碼倉）</strong><br>
-            &nbsp;&nbsp;&nbsp;例如「帳面盈餘策略一 ＋ 真實現金流策略三」同時達標（如 GOOGL、NVDA），或「高點打 7 折策略二 ＋ 策略三」同時達標（如 AVGO），代表基本面與技術面雙重確認，再加碼 30%~40%！<br><br>
-            3️⃣ <strong>【三個策略全部滿足（🔥 3軌全滿）】➔ 放入大量資金至 <span style="color:#fda4af;font-weight:700;">100% 滿倉 ＋ 同步大買 QQQ</span>（股災世紀買點）</strong><br>
-            &nbsp;&nbsp;&nbsp;代表股價既從高點跌超過 30%，連最嚴苛的帳面盈餘與自由現金流也全部跌破 7 折（如 2022 年股災的 META、NVDA，或目前的 NFLX）！此時將 SHV 短債資金大舉換入，買滿 100% 並抱緊處理！
+            每週打開本系統巡檢一次，每一檔個股的「目標滿倉額度」設定為<strong>衛星倉的 10%（即總資產的 5% 上限，最多分散持有 10 檔）</strong>，嚴格執行金字塔分批建倉：<br><br>
+            1️⃣ <strong>【滿足 1 個獨立策略（🟢 1軌達標）】➔ 投入該股額度的 <span style="color:var(--accent-cyan);font-weight:700;">30% 資金（佔總資產 1.5%）</span></strong><br>
+            &nbsp;&nbsp;&nbsp;（註：若策略一與策略三因採用相同獲利基數而算出相同目標價，系統會自動合併為 1 軌，不重複灌水！）<br><br>
+            2️⃣ <strong>【同時滿足 2 個獨立策略（🟢🟢 2軌達標）】➔ 累計投入該股額度的 <span style="color:var(--accent-emerald);font-weight:700;">60% 資金（佔總資產 3.0%）</span></strong><br>
+            &nbsp;&nbsp;&nbsp;代表基本面與技術面/遠期現金流雙重確認打 7 折，安全邊際極高！<br><br>
+            3️⃣ <strong>【三個策略全部滿足（🔥 3軌全滿）】➔ 買滿該股額度的 <span style="color:#fda4af;font-weight:700;">100% 滿倉（佔總資產 5.0%）＋ 抄底 QQQ</span></strong><br>
+            &nbsp;&nbsp;&nbsp;（🛡️ <strong>價值陷阱防禦鎖</strong>：若該股當期盈餘較 2025 年衰退超過 20%，系統會自動將倉位鎖定在 30% 試單上限，防止買滿基本面惡化股！）
           </p>
         </div>
       </div>
@@ -1730,7 +1863,7 @@ def export_html_dashboard(results: List[ValuationResult], cfg: ValuationConfig, 
               <td><strong style="color:var(--accent-cyan);">CSPX / BND / SHV / QQQ</strong></td>
               <td style="text-align:left;">Core Portfolio ETFs</td>
               <td style="text-align:left;"><strong>我的四大資產配置 ETF 代號</strong></td>
-              <td style="text-align:left;white-space:normal;"><strong>CSPX</strong> = 愛爾蘭省稅版標普500（即我記的 CSCP）；<strong>BND</strong> = 總體債券防守倉；<strong>SHV</strong> = 短期美債現金停泊池；<strong>QQQ</strong> = 那斯達克100（股災大跌時的抄底首選）。</td>
+              <td style="text-align:left;white-space:normal;"><strong>CSPX</strong> = 愛爾蘭省稅版標普500（即我記的 CSCP，佔總資金35%）；<strong>BND</strong> = 總體債券防守倉（佔15%）；<strong>SHV</strong> = 短期美債現金停泊池；<strong>QQQ</strong> = 那斯達克100（股災抄底首選）。</td>
             </tr>
           </tbody>
         </table>
@@ -1739,23 +1872,23 @@ def export_html_dashboard(results: List[ValuationResult], cfg: ValuationConfig, 
   </div>
 
   <!-- ===================================================================== -->
-  <!-- TAB 2: 每週巡檢監控表 (全中文表頭 + 52週股價區間視覺尺 + 滿足幾軌 + 7折買價與10折賣價) -->
+  <!-- TAB 2: 每週巡檢監控表 -->
   <!-- ===================================================================== -->
   <div id="tab-monitor" class="tab-panel">
     <!-- KPI Summary -->
     <div class="kpi-grid">
       <div class="kpi-card k-t3">
-        <div class="kpi-title">🔥 3 軌全滿（投入 100% 大量資金 / 股災黃金坑）</div>
+        <div class="kpi-title">🔥 3 軌全滿（投入單股額度 100% / 佔總資產 5%）</div>
         <div class="kpi-value" style="color: #fda4af;" id="kpi-3-count">0 檔</div>
         <div class="kpi-sub" id="kpi-3-tickers">-</div>
       </div>
       <div class="kpi-card k-t2">
-        <div class="kpi-title">🟢🟢 2 軌同時滿足（投入 60% 主力加碼資金）</div>
+        <div class="kpi-title">🟢🟢 2 軌同時滿足（投入單股額度 60% / 佔總資產 3%）</div>
         <div class="kpi-value" style="color: var(--accent-emerald);" id="kpi-2-count">0 檔</div>
         <div class="kpi-sub" id="kpi-2-tickers">-</div>
       </div>
       <div class="kpi-card k-t1">
-        <div class="kpi-title">🟢 1 軌滿足（投入 30% 基本試單資金）</div>
+        <div class="kpi-title">🟢 1 軌獨立滿足（投入單股額度 30% / 佔總資產 1.5%）</div>
         <div class="kpi-value" style="color: var(--accent-cyan);" id="kpi-1-count">0 檔</div>
         <div class="kpi-sub" id="kpi-1-tickers">-</div>
       </div>
@@ -1802,9 +1935,9 @@ def export_html_dashboard(results: List[ValuationResult], cfg: ValuationConfig, 
     <div class="filter-bar">
       <div class="filter-pills">
         <button class="pill-btn active" onclick="setFilter('ALL', this)">全部 {len(results)} 檔巨頭</button>
-        <button class="pill-btn" onclick="setFilter('T3', this)">🔥 3軌全滿 (投100%)</button>
-        <button class="pill-btn" onclick="setFilter('T2', this)">🟢🟢 2軌滿足 (投60%)</button>
-        <button class="pill-btn" onclick="setFilter('T1', this)">🟢 1軌滿足 (投30%)</button>
+        <button class="pill-btn" onclick="setFilter('T3', this)">🔥 3軌全滿 (單股100%)</button>
+        <button class="pill-btn" onclick="setFilter('T2', this)">🟢🟢 2軌滿足 (單股60%)</button>
+        <button class="pill-btn" onclick="setFilter('T1', this)">🟢 1軌滿足 (單股30%)</button>
         <button class="pill-btn" onclick="setFilter('NEAR', this)">🟡 接近買點 (+10%內)</button>
         <button class="pill-btn" onclick="setFilter('CLOUD_AI', this)">☁️ AI 雲端</button>
         <button class="pill-btn" onclick="setFilter('SEMI_AI', this)">⚡ AI 晶片</button>
@@ -1824,7 +1957,7 @@ def export_html_dashboard(results: List[ValuationResult], cfg: ValuationConfig, 
       <table>
         <thead>
           <tr>
-            <th onclick="sortBy('ticker')">股票代號 / 公司與資料源 ↕</th>
+            <th onclick="sortBy('ticker')">股票代號 / 公司與欄位透明度 ↕</th>
             <th onclick="sortBy('current_price')">目前股價 ＆ 52週高低位階尺 ↕</th>
             <th onclick="sortBy('cagr_pct')">5年歷史成長率<br>(CAGR) ↕</th>
             <th onclick="sortBy('discounted_pe')">打7折後給的<br>目標本益比 ↕</th>
@@ -1833,7 +1966,7 @@ def export_html_dashboard(results: List[ValuationResult], cfg: ValuationConfig, 
             <th onclick="sortBy('s3_target_price')">【策略三】買價<br>真實現金流7折 ↕</th>
             <th onclick="sortBy('recommended_diff_pct')">🟢 推薦7折買進價<br>(與現價差距) ↕</th>
             <th onclick="sortBy('fair_sell_price_100')">🎯 賣股參考價<br>(10折合理 / 12折過熱) ↕</th>
-            <th onclick="sortBy('matched_tracks_count')">滿足幾軌 ＆ 建議投入資金比例 ↕</th>
+            <th onclick="sortBy('matched_tracks_count')">獨立滿足軌數 ＆ 建議投入比例 ↕</th>
           </tr>
         </thead>
         <tbody id="table-body"></tbody>
@@ -1842,31 +1975,28 @@ def export_html_dashboard(results: List[ValuationResult], cfg: ValuationConfig, 
   </div>
 
   <!-- ===================================================================== -->
-  <!-- TAB 3: 賣股時機判斷指南 ＆ 五年回測跑出範例驗證頁 -->
+  <!-- TAB 3: 賣股時機判斷指南 ＆ 無前視偏差五年回測範例驗證頁 -->
   <!-- ===================================================================== -->
   <div id="tab-sell-guide" class="tab-panel">
     <div class="analysis-grid">
       <div class="analysis-card">
-        <h3>⚖️ 一、賣股的時間怎麼判斷？回測上面的「賣出數值」是什麼理由？</h3>
+        <h3>⚖️ 一、賣股的時間怎麼判斷？無前視偏差 (Point-in-Time) 回測的「三種出場方式」實證對決</h3>
         <div class="rule-box green">
-          <h4>💡 回測採用的賣出數值理由：為什麼「7 折買進 ➔ 漲回 10 折合理價（賺 +42.86%）」就觸發停利？</h4>
+          <h4>💡 回測採用的賣出數值理由：為什麼「7 折買進 ➔ 漲回買進時點之 10 折合理價（賺 +42.86%）」觸發停利？</h4>
           <p>
-            • <strong>數學原理非常直觀</strong>：假設一家公司真正的「10 折合理價值（PEG = 1.0 理想價）」是 <strong>$100 元</strong>。<br>
-            • 我們耐心等到它打 7 折（<strong>$70 元</strong>）才買進。<br>
-            • 當市場恐慌結束、股價從 $70 元重新漲回原本的 10 折合理價值 <strong>$100 元</strong> 時，您的獲利幅度正好是：<br>
-            &nbsp;&nbsp;<code>($100 - $70) ÷ $70 = +42.86%</code>（公式：<code>7折買進目標價 ÷ 0.70 = 10折合理賣出價</code>）。<br>
-            • <strong>回測的第二賣出條件（滿 1 年時間停利）</strong>：如果買進後抱滿 <strong>1 年（252 個交易日）</strong>，股價還沒漲到 +42.86%，但已經<strong>獲利超過 +15%</strong>，回測系統也會獲利了結，把資金收回 SHV 短債等待下一檔打 7 折的股票。
+            • <strong>數學原理與消除前視偏差</strong>：假設買進當下（Point-in-Time）公司真正的「10 折合理價值（PEG = 1.0）」是 <strong>$100 元</strong>，我們等到打 7 折（<strong>$70 元</strong>）才買進。當市場恐慌結束、股價從 $70 元重新漲回進場時點的 10 折合理價值 <strong>$100 元</strong> 時，獲利幅度正好是 <code>($100 - $70) ÷ $70 = +42.86%</code>（公式：<code>進場7折目標價 ÷ 0.70 = 10折合理賣出價</code>，完全不偷看未來財報！）。<br>
+            • <strong>第二賣出條件（滿 1 年時間停利）</strong>：若買進後抱滿 <strong>1 年（252 個交易日）</strong> 且<strong>獲利超過 +15%</strong>，回測系統也會獲利了結，將資金轉入下一檔打 7 折的便宜好股。
           </p>
         </div>
 
         <div class="rule-box amber">
-          <h4>🏆 給您的實戰最佳賣股 SOP：「半倉 10~12 折收回成本 ＋ 半倉抱緊處理」</h4>
+          <h4>🏆 三種賣股策略 5 年無前視偏差量化回測實證結果（動態讀取自 <code>peg_backtest_meta.json</code>）</h4>
           <p>
-            我們在五年回測中發現：如果漲到 10 折合理價（賺 +42.9%）就把股票<strong>全部賣光</strong>，5 年總報酬是 <strong>+253%</strong>；但如果買在 7 折後<strong>「抱緊處理（不賣）」</strong>，因為不會提早賣飛 NVDA (+965%)、AVGO (+532%)、META (+254%)，平均報酬率高達 <strong>+354%</strong>！<br><br>
-            因此，最不怕賣錯、心理最舒服的<strong>「三階段賣股法則」</strong>如下（下方表格已直接幫您算出每檔股票的價格）：<br>
-            1️⃣ <strong>【第一階段：漲到「🎯 10 折合理價」（約賺 +43%）】</strong>➔ 先賣出 <strong>1/3 部位</strong>，把賺到的錢轉回 <strong>CSPX</strong> 或 <strong>SHV</strong>，讓剩下的股票成本大幅降低。<br>
-            2️⃣ <strong>【第二階段：漲到「🔥 12 折過熱價」（PEG = 1.2，約賺 +71%）】</strong>➔ 再賣出 <strong>1/3 部位</strong>，至此您已經把當初投入的本金全部拿回來了！<br>
-            3️⃣ <strong>【第三階段：最後 1/3 零成本股票】</strong>➔ <strong>永久「抱緊處理」</strong>！除非公司連續兩季預估盈餘 (Forward EPS) 與自由現金流衰退超過 15%，否則一輩子不賣，安心領股利與享受十倍股複利！
+            我們將歷史財報嚴格鎖定在買進當下可知的過去 5 年滾動成長率（Point-in-Time），對比三種出場方式：<br>
+            • <strong>方式 A【漲回 10 折合理價 (+42.9%) 全部賣光並滾動換股】</strong>：5 年 $10 萬組合總報酬 <strong style="color:var(--accent-cyan);">+{bt_meta.get('smart_portfolio_return_pct', 389.1):.1f}%</strong>（年化 <strong>+{bt_meta.get('smart_portfolio_cagr_pct', 37.5):.1f}%</strong>，勝率 <strong>{bt_meta.get('smart_portfolio_win_rate_pct', 90.0):.1f}%</strong>，同期 SPY 為 +{bt_meta.get('spy_return_pct', 82.2):.1f}%）。<br>
+            • <strong>方式 B【三階段分批停利（10 折賣 1/3、12 折賣 1/3、最後 1/3 永久抱緊）】</strong>：觸發個股平均總報酬 <strong style="color:var(--accent-emerald);">+{bt_meta.get('avg_staged_3tier_return_pct', 268.1):.1f}%</strong>（兼具鎖定現金落袋與保留長線飆股底倉，最符合人性！）。<br>
+            • <strong>方式 C【7 折買進後完全不賣一路抱到底】</strong>：觸發個股平均總報酬 <strong style="color:var(--accent-amber);">+{bt_meta.get('avg_hold_from_entry_return_pct', 344.5):.1f}%</strong>（雖報酬高但期間須承受 -40% 以上劇烈回撤，且資金無法回收再買新打折股）。<br><br>
+            <strong>👉 實戰結論</strong>：若您想要資金周轉買進新打折股並降低心理壓力，請採<strong>「10 折賣 1/3、12 折賣 1/3、剩餘 1/3 零成本底倉抱緊處理」</strong>！
           </p>
         </div>
       </div>
@@ -2093,24 +2223,43 @@ def export_html_dashboard(results: List[ValuationResult], cfg: ValuationConfig, 
       }}
       const [recSig, recDiff] = evaluateSig(d.current_price, recTarget, nearThresh);
 
+      const s1s3Identical = Math.abs(s3Target - s1Target) / Math.max(1.0, s1Target) < 0.03;
       const trBuys = [];
-      if (s1Sig === 'BUY') trBuys.push('策略一');
-      if (s2Sig === 'BUY' && s2Valid) trBuys.push('策略二');
-      if (s3Sig === 'BUY') trBuys.push('策略三');
+      if (s1Sig === 'BUY' && s3Sig === 'BUY' && s1s3Identical && !(s2Sig === 'BUY' && s2Valid)) {{
+        trBuys.push('策略一/三(同源獲利)');
+      }} else {{
+        if (s1Sig === 'BUY') trBuys.push('策略一');
+        if (s2Sig === 'BUY' && s2Valid) trBuys.push('策略二');
+        if (s3Sig === 'BUY') trBuys.push('策略三');
+      }}
       const matchedCnt = trBuys.length;
+
+      const drawDownFromHigh = d.high_52w > 0 ? ((d.current_price - d.high_52w) / d.high_52w) * 100.0 : 0.0;
+      const epsContraction = d.eps_2025 > 0 && d.gaap_ttm_eps < (d.eps_2025 * 0.80);
+      const cbTriggered = matchedCnt >= 2 && (epsContraction || drawDownFromHigh <= -45.0);
 
       const anyNear = (s1Sig === 'NEAR') || (s3Sig === 'NEAR') || (s2Sig === 'NEAR' && s2Valid);
       let overall = '⚪ 0軌 (觀望領息)';
       let allocSuggest = '⚪ 投入 0% (SHV短債領息)';
       if (matchedCnt === 3) {{
-        overall = `🔥 3軌全滿 (${{trBuys.join('/')}})`;
-        allocSuggest = '🔥 投入 100% 大量資金 (三軌全滿重倉)';
+        if (cbTriggered) {{
+          overall = `⚠️ 3軌觸發但啟動防禦鎖 (${{trBuys.join('/')}})`;
+          allocSuggest = '🛡️ 限縮至該股額度 30% (價值陷阱防禦鎖：深跌或獲利衰退)';
+        }} else {{
+          overall = `🔥 3軌全滿 (${{trBuys.join('/')}})`;
+          allocSuggest = '🔥 投入該股額度 100% (佔總資產上限5% / 三軌全滿)';
+        }}
       }} else if (matchedCnt === 2) {{
-        overall = `🟢🟢 2軌滿足 (${{trBuys.join('/')}})`;
-        allocSuggest = '🟢🟢 投入 60% 資金 (雙軌確認加碼)';
+        if (cbTriggered) {{
+          overall = `⚠️ 2軌觸發但啟動防禦鎖 (${{trBuys.join('/')}})`;
+          allocSuggest = '🛡️ 限縮至該股額度 30% (價值陷阱防禦鎖：深跌或獲利衰退)';
+        }} else {{
+          overall = `🟢🟢 2軌滿足 (${{trBuys.join('/')}})`;
+          allocSuggest = '🟢🟢 投入該股額度 60% (佔總資產3% / 雙軌加碼)';
+        }}
       }} else if (matchedCnt === 1) {{
         overall = `🟢 1軌滿足 (${{trBuys[0]}})`;
-        allocSuggest = '🟢 投入 30% 資金 (單軌試單建倉)';
+        allocSuggest = '🟢 投入該股額度 30% (佔總資產1.5% / 單軌試單)';
       }} else if (anyNear) {{
         const trN = [];
         if (s1Sig === 'NEAR') trN.push('策略一');
@@ -2143,6 +2292,7 @@ def export_html_dashboard(results: List[ValuationResult], cfg: ValuationConfig, 
         recommended_diff_pct: recDiff,
         rec_sig_code: recSig,
         matched_tracks_count: matchedCnt,
+        circuit_breaker_triggered: cbTriggered,
         alloc_pct_suggestion: allocSuggest,
         fair_sell_price_100: fairSell100,
         overheated_sell_price_120: overheatedSell120,
@@ -2218,9 +2368,12 @@ def export_html_dashboard(results: List[ValuationResult], cfg: ValuationConfig, 
         <span class="track-seg ${{d.matched_tracks_count >= 3 ? segCls : ''}}"></span>
       </span>`;
 
-      const srcBadge = d.data_source.includes('LIVE')
-        ? '<span style="color:var(--accent-emerald);font-size:0.7rem;">● Yahoo即時</span>'
-        : '<span style="color:var(--text-muted);font-size:0.7rem;">○ 備援基準</span>';
+      let srcBadge = '<span style="color:var(--text-muted);font-size:0.7rem;">○ 離線基準</span>';
+      if (d.data_source.startsWith('LIVE')) {{
+        srcBadge = `<span style="color:var(--accent-emerald);font-size:0.7rem;" title="${{d.data_source}}">● 即時連線</span>`;
+      }} else if (d.data_source.startsWith('HYBRID')) {{
+        srcBadge = `<span style="color:var(--accent-amber);font-size:0.7rem;" title="${{d.data_source}}">◐ 報價即時+部分備援</span>`;
+      }}
 
       const vBadge = d.s2_backtest_valid
         ? '<span style="color:var(--accent-emerald);font-size:0.74rem;">✓ 一年內曾跌到</span>'
@@ -2273,8 +2426,9 @@ def export_html_dashboard(results: List[ValuationResult], cfg: ValuationConfig, 
     const btSumTbody = document.getElementById('bt-summary-tbody');
     if (btSumTbody && BT_SUMMARIES.length > 0) {{
       btSumTbody.innerHTML = BT_SUMMARIES.map(s => {{
-        const netPct = parseFloat(s['單筆平均淨報酬 (扣費後 %)'] || 0);
-        const totProfit = parseFloat(s['累計波段淨獲利 (每筆1萬美元基準 $)'] || 0);
+        const netPct = parseFloat(s['A_單筆平均淨報酬(%)'] || s['單筆平均淨報酬 (扣費後 %)'] || 0);
+        const totProfit = parseFloat(s['A_累計波段淨獲利($)'] || s['累計波段淨獲利 (每筆1萬美元基準 $)'] || 0);
+        const stage3Pct = parseFloat(s['B_三段式分批總報酬(%)'] || netPct);
         const cls = netPct >= 0 ? 'diff-neg' : 'con-item';
         return `<tr class="mono-num">
           <td style="text-align:left;"><span class="ticker-badge">${{s['代號']}}</span></td>
@@ -2286,7 +2440,7 @@ def export_html_dashboard(results: List[ValuationResult], cfg: ValuationConfig, 
           <td>${{s['平均持有交易日']}} 天</td>
           <td>$${{parseFloat(s['累計手續費支出 ($)'] || 0).toFixed(2)}}</td>
           <td class="${{totProfit >= 0 ? 'diff-neg' : ''}}"><strong>${{totProfit >= 0 ? '+' : ''}}$${{totProfit.toLocaleString()}}</strong></td>
-          <td style="color:var(--accent-emerald);">+${{s['最佳單筆報酬 (%)']}}%</td>
+          <td style="color:var(--accent-emerald);">+${{stage3Pct.toFixed(1)}}% (三段式)</td>
           <td style="color:var(--text-muted);">${{parseFloat(s['同期5年Buy&Hold報酬 (%)']) >= 0 ? '+' : ''}}${{s['同期5年Buy&Hold報酬 (%)']}}%</td>
         </tr>`;
       }}).join('');
@@ -2454,9 +2608,11 @@ def export_html_dashboard(results: List[ValuationResult], cfg: ValuationConfig, 
     const coreUsd = totalUsd * (corePct / 100.0);
     const satUsd = totalUsd * (satPct / 100.0);
 
-    const t3Stocks = currentData.filter(d => d.matched_tracks_count === 3);
-    const t2Stocks = currentData.filter(d => d.matched_tracks_count === 2);
-    const t1Stocks = currentData.filter(d => d.matched_tracks_count === 1 && (d.s1_signal === 'BUY' || d.s3_signal === 'BUY'));
+    const t3Stocks = currentData.filter(d => d.matched_tracks_count === 3 && !d.circuit_breaker_triggered);
+    const t2Stocks = currentData.filter(d => d.matched_tracks_count === 2 && !d.circuit_breaker_triggered);
+    const t1Stocks = currentData.filter(d => (d.matched_tracks_count === 1 && (d.s1_signal === 'BUY' || d.s3_signal === 'BUY')) || d.circuit_breaker_triggered);
+    const nearStocks = currentData.filter(d => d.matched_tracks_count === 0 && d.overall_signal.includes('🟡'));
+    const nearLabel = nearStocks.length > 0 ? nearStocks.map(n => n.ticker).join('/') : '接近買點標的';
 
     const perSlotMax = satUsd * 0.10;
     const t3Invest = t3Stocks.length * (perSlotMax * 1.00);
@@ -2469,23 +2625,23 @@ def export_html_dashboard(results: List[ValuationResult], cfg: ValuationConfig, 
       <div class="strat-box">
         <h4 style="color:var(--accent-cyan);margin-bottom:10px;">🛡️ 【核心底倉 ${{corePct}}%】避險與全球資產配置 (<span class="mono-num">$${{coreUsd.toLocaleString()}}</span>)</h4>
         <ul class="note-list">
-          <li><strong>英股 CSPX（愛爾蘭註冊 S&P 500 累積型 ETF，取代 VOO/SPY 省股息稅與遺產稅）</strong> — 佔核心 60%（總資金 ${{Math.round(corePct*0.6)}}%）：<strong class="mono-num" style="color:var(--accent-cyan);">$${{Math.round(coreUsd*0.60).toLocaleString()}}</strong></li>
-          <li><strong>美股 BND（Vanguard 美國總體債券市場 ETF，系統性崩盤防守與降息避險）</strong> — 佔核心 40%（總資金 ${{Math.round(corePct*0.4)}}%）：<strong class="mono-num" style="color:var(--accent-purple);">$${{Math.round(coreUsd*0.40).toLocaleString()}}</strong></li>
+          <li><strong>英股 CSPX（愛爾蘭註冊 S&P 500 累積型 ETF，取代 VOO/SPY 省股息稅與遺產稅）</strong> — 佔核心 70%（總資金 ${{(corePct*0.7).toFixed(1)}}%）：<strong class="mono-num" style="color:var(--accent-cyan);">$${{Math.round(coreUsd*0.70).toLocaleString()}}</strong></li>
+          <li><strong>美股 BND（Vanguard 美國總體債券市場 ETF，系統性衰退避險；留意暴力升息年股債同跌風險與 $60k 遺產稅免稅額邊界）</strong> — 佔核心 30%（總資金 ${{(corePct*0.3).toFixed(1)}}%）：<strong class="mono-num" style="color:var(--accent-purple);">$${{Math.round(coreUsd*0.30).toLocaleString()}}</strong></li>
         </ul>
       </div>
       <div class="strat-box recommended">
         <h4 style="color:var(--accent-emerald);margin-bottom:10px;">🎯 【衛星狙擊倉 ${{satPct}}%】SHV 短債停泊 ＋ 1/2/3 軌分批買進 ＋ QQQ 股災抄底 (<span class="mono-num">$${{satUsd.toLocaleString()}}</span>)</h4>
         <ul class="note-list">
-          <li><strong>🔥 3 軌全滿個股（投入該股額度 100% 大量資金，每檔 <span class="mono-num">$${{Math.round(perSlotMax).toLocaleString()}}</span>）</strong>：<br>
+          <li><strong>🔥 3 軌全滿個股（投入該股額度 100% 即總資金 5%，每檔 <span class="mono-num">$${{Math.round(perSlotMax).toLocaleString()}}</span>）</strong>：<br>
             ${{t3Stocks.map(b => `<strong style="color:#fda4af;">${{b.ticker}}</strong> (現價 $${{b.current_price.toFixed(2)}} → 10折賣價 $${{b.fair_sell_price_100.toFixed(2)}})`).join('、') || '目前無'}}
           </li>
-          <li><strong>🟢🟢 2 軌同時滿足個股（投入該股額度 60% 主力資金，每檔 <span class="mono-num">$${{Math.round(perSlotMax*0.6).toLocaleString()}}</span>）</strong>：<br>
+          <li><strong>🟢🟢 2 軌同時滿足個股（投入該股額度 60% 即總資金 3%，每檔 <span class="mono-num">$${{Math.round(perSlotMax*0.6).toLocaleString()}}</span>）</strong>：<br>
             ${{t2Stocks.map(b => `<strong style="color:var(--accent-emerald);">${{b.ticker}}</strong> (現價 $${{b.current_price.toFixed(2)}} → 10折賣價 $${{b.fair_sell_price_100.toFixed(2)}})`).join('、') || '目前無'}}
           </li>
-          <li><strong>🟢 1 軌基本面滿足個股（投入該股額度 30% 試單資金，每檔 <span class="mono-num">$${{Math.round(perSlotMax*0.3).toLocaleString()}}</span>）</strong>：<br>
+          <li><strong>🟢 1 軌基本面滿足或啟動防禦鎖個股（投入該股額度 30% 即總資金 1.5%，每檔 <span class="mono-num">$${{Math.round(perSlotMax*0.3).toLocaleString()}}</span>）</strong>：<br>
             ${{t1Stocks.map(b => `<strong style="color:var(--accent-cyan);">${{b.ticker}}</strong> (現價 $${{b.current_price.toFixed(2)}} → 10折賣價 $${{b.fair_sell_price_100.toFixed(2)}})`).join('、') || '目前無'}}
           </li>
-          <li><strong>💵 停泊於【SHV 短期美債 ETF】領息待命（等待黃燈標的 AMZN/TSM 打折，或等股災來臨大買【QQQ】）</strong>：<strong class="mono-num" style="color:var(--accent-amber);">$${{Math.round(shvReserve).toLocaleString()}}</strong></li>
+          <li><strong>💵 停泊於【SHV 短期美債 ETF（或英股 IB01.L）】領息待命（等待黃燈標的 ${{nearLabel}} 打折，或等股災來臨大買【QQQ / CNDX.L】）</strong>：<strong class="mono-num" style="color:var(--accent-amber);">$${{Math.round(shvReserve).toLocaleString()}}</strong></li>
         </ul>
       </div>
     `;
@@ -2581,8 +2737,9 @@ def send_email_report(results: List[ValuationResult], cfg: ValuationConfig, reci
 def load_stock_universe() -> List[StockBaseline]:
     """
     載入 22 檔內建基準標的，並自動檢查 watchlist_config.json 是否有使用者額外新增或自訂的股票。
+    使用 dataclasses.replace 複製物件，絕不直接修改全域 BASELINE_STOCKS 常數。
     """
-    base_map = {s.ticker: s for s in BASELINE_STOCKS}
+    base_map: Dict[str, StockBaseline] = {s.ticker: dataclasses.replace(s) for s in BASELINE_STOCKS}
     cfg_path = Path("watchlist_config.json")
     if cfg_path.exists():
         try:
@@ -2592,14 +2749,21 @@ def load_stock_universe() -> List[StockBaseline]:
                 if not tk:
                     continue
                 if tk in base_map:
-                    # 允許使用者透過 watchlist_config.json 更新基準年與 EPS
                     s = base_map[tk]
-                    s.base_year = int(item.get("base_year", s.base_year))
-                    s.base_eps = float(item.get("base_eps", s.base_eps))
-                    s.eps_2025 = float(item.get("eps_2025", s.eps_2025))
-                    s.raw_cagr = float(item.get("raw_cagr", s.raw_cagr))
+                    b_yr = int(item.get("base_year", s.base_year))
+                    b_eps = float(item.get("base_eps", s.base_eps))
+                    l_eps = float(item.get("eps_2025", s.eps_2025))
+                    n_yr = max(1, 2025 - b_yr)
+                    default_cagr = calculate_cagr(b_eps, l_eps, n_yr) if (b_eps != s.base_eps or l_eps != s.eps_2025) else s.raw_cagr
+                    cagr = float(item.get("raw_cagr", default_cagr))
+                    base_map[tk] = dataclasses.replace(
+                        s,
+                        base_year=b_yr,
+                        base_eps=b_eps,
+                        eps_2025=l_eps,
+                        raw_cagr=round(cagr, 2),
+                    )
                 else:
-                    # 使用者於 watchlist_config.json 新增的第 23+ 檔自選股
                     b_eps = float(item.get("base_eps", 1.0))
                     l_eps = float(item.get("eps_2025", 2.0))
                     b_yr = int(item.get("base_year", 2020))
@@ -2632,9 +2796,10 @@ def run_tracker(
     use_offline: bool = False,
     tickers_filter: Optional[List[str]] = None,
     max_workers: int = 8,
+    use_sec_edgar: bool = False,
 ) -> List[ValuationResult]:
     """並行取得追蹤標的資料並執行三軌估值分析"""
-    universe = load_stock_universe() if not use_offline else BASELINE_STOCKS
+    universe = load_stock_universe() if not use_offline else [dataclasses.replace(s) for s in BASELINE_STOCKS]
     target_stocks = universe
     if tickers_filter:
         upper_set = {t.strip().upper() for t in tickers_filter if t.strip()}
@@ -2643,11 +2808,11 @@ def run_tracker(
     metrics_map: Dict[str, Dict[str, Any]] = {}
     if use_offline or not HAS_YFINANCE:
         for s in target_stocks:
-            metrics_map[s.ticker] = fetch_live_stock_metrics(s, use_offline=True)
+            metrics_map[s.ticker] = fetch_live_stock_metrics(s, use_offline=True, use_sec_edgar=False)
     else:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_ticker = {
-                executor.submit(fetch_live_stock_metrics, s, False): s.ticker
+                executor.submit(fetch_live_stock_metrics, s, False, use_sec_edgar): s.ticker
                 for s in target_stocks
             }
             for future in as_completed(future_to_ticker):
@@ -2656,7 +2821,7 @@ def run_tracker(
                     metrics_map[tk_name] = future.result()
                 except Exception:
                     stock_obj = next(s for s in target_stocks if s.ticker == tk_name)
-                    metrics_map[tk_name] = fetch_live_stock_metrics(stock_obj, use_offline=True)
+                    metrics_map[tk_name] = fetch_live_stock_metrics(stock_obj, use_offline=True, use_sec_edgar=False)
 
     results: List[ValuationResult] = []
     for s in target_stocks:
@@ -2671,6 +2836,7 @@ def parse_args() -> argparse.Namespace:
         description="美股三大指數與 AI 企業巨頭「本益成長比 (PEG) 7 折三軌監控系統」"
     )
     parser.add_argument("--offline", action="store_true", help="強制使用規格書內建之 22 檔基準資料庫（不連線 yfinance）")
+    parser.add_argument("--sec-edgar", action="store_true", help="同步連線美國證管會 SEC EDGAR 官方 XBRL API 交叉校驗歷史 Diluted EPS")
     parser.add_argument("--discount", type=float, default=0.70, help="安全邊際折數 (預設: 0.70)")
     parser.add_argument("--max-pe", type=float, default=45.0, help="合理本益比封頂上限 (預設: 45.0)")
     parser.add_argument("--min-cagr", type=float, default=5.0, help="最低成長率門檻 %% (預設: 5.0)")
@@ -2683,10 +2849,11 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def archive_weekly_snapshot(results: List[ValuationResult]) -> Tuple[Path, Path]:
+def archive_weekly_snapshot(results: List[ValuationResult], use_offline: bool = False) -> Tuple[Path, Path]:
     """
     每次執行時，自動將當日完整估值報表備份至 history_snapshots/ 資料夾，
-    並於 history_snapshots/weekly_summary_log.csv 追加一筆每週巡檢摘要紀錄，確保歷史資料永久留存不遺失。
+    並於 history_snapshots/weekly_summary_log.csv 以「按日期覆寫去重 (Upsert by Date)」方式更新當日巡檢摘要紀錄，
+    確保同一天重複執行不會產生重複垃圾列，且 --offline 測試模式不會污染正式歷史日誌。
     """
     snap_dir = Path("history_snapshots")
     snap_dir.mkdir(exist_ok=True)
@@ -2696,10 +2863,14 @@ def archive_weekly_snapshot(results: List[ValuationResult]) -> Tuple[Path, Path]
 
     # 1. 儲存當日完整 22 檔估值快照 CSV
     dated_csv_path = (snap_dir / f"peg_report_{today_str}.csv").resolve()
-    export_csv_report(results, dated_csv_path)
+    if not use_offline:
+        export_csv_report(results, dated_csv_path)
 
-    # 2. 追加一筆摘要紀錄至 weekly_summary_log.csv
+    # 2. 按日期 Upsert 至 weekly_summary_log.csv（同一日僅保留最新一筆，且 offline 模式不寫入）
     summary_log_path = (snap_dir / "weekly_summary_log.csv").resolve()
+    if use_offline:
+        return dated_csv_path, summary_log_path
+
     t3 = [f"{r.ticker}(${r.current_price:.1f})" for r in results if r.matched_tracks_count == 3]
     t2 = [f"{r.ticker}(${r.current_price:.1f})" for r in results if r.matched_tracks_count == 2]
     t1 = [f"{r.ticker}(${r.current_price:.1f})" for r in results if r.matched_tracks_count == 1]
@@ -2710,20 +2881,35 @@ def archive_weekly_snapshot(results: List[ValuationResult]) -> Tuple[Path, Path]
         "🔥 3軌全滿 (投100%名單)", "🟢🟢 2軌滿足 (投60%名單)",
         "🟢 1軌滿足 (投30%名單)", "🟡 接近買點預警 (+10%內名單)"
     ]
-    file_exists = summary_log_path.exists()
-    with summary_log_path.open("a", encoding="utf-8-sig", newline="") as f:
+    new_row = {
+        "巡檢紀錄時間": now_str,
+        "日期": today_str,
+        "追蹤總檔數": str(len(results)),
+        "🔥 3軌全滿 (投100%名單)": ", ".join(t3) if t3 else "無",
+        "🟢🟢 2軌滿足 (投60%名單)": ", ".join(t2) if t2 else "無",
+        "🟢 1軌滿足 (投30%名單)": ", ".join(t1) if t1 else "無",
+        "🟡 接近買點預警 (+10%內名單)": ", ".join(nears) if nears else "無",
+    }
+
+    existing_rows_by_date: Dict[str, Dict[str, str]] = {}
+    if summary_log_path.exists():
+        try:
+            with summary_log_path.open("r", encoding="utf-8-sig", newline="") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    d_key = row.get("日期", "").strip()
+                    if d_key:
+                        existing_rows_by_date[d_key] = row
+        except Exception:
+            pass
+
+    existing_rows_by_date[today_str] = new_row
+
+    with summary_log_path.open("w", encoding="utf-8-sig", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=log_headers)
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow({
-            "巡檢紀錄時間": now_str,
-            "日期": today_str,
-            "追蹤總檔數": len(results),
-            "🔥 3軌全滿 (投100%名單)": ", ".join(t3) if t3 else "無",
-            "🟢🟢 2軌滿足 (投60%名單)": ", ".join(t2) if t2 else "無",
-            "🟢 1軌滿足 (投30%名單)": ", ".join(t1) if t1 else "無",
-            "🟡 接近買點預警 (+10%內名單)": ", ".join(nears) if nears else "無",
-        })
+        writer.writeheader()
+        for d_key in sorted(existing_rows_by_date.keys()):
+            writer.writerow(existing_rows_by_date[d_key])
 
     return dated_csv_path, summary_log_path
 
@@ -2738,7 +2924,9 @@ def main() -> int:
     )
     tickers_list = [x for x in args.tickers.split(",") if x.strip()] if args.tickers else None
 
-    mode_label = "離線基準驗證模式 (BASELINE)" if args.offline else "即時網路連線模式 (yfinance + 自動備援)"
+    mode_label = "離線基準驗證模式 (BASELINE)" if args.offline else "即時網路連線模式 (Yahoo Finance 公開市場資料 + 自動分欄備援)"
+    if args.sec_edgar and not args.offline:
+        mode_label += " + SEC EDGAR XBRL 校驗"
     if hasattr(sys.stdout, "reconfigure"):
         try:
             sys.stdout.reconfigure(encoding="utf-8")
@@ -2746,19 +2934,26 @@ def main() -> int:
             pass
     print(f"🚀 啟動「美股 AI 巨頭 PEG 7 折三軌監控系統」— 模式：{mode_label} ...")
 
-    results = run_tracker(cfg=cfg, use_offline=args.offline, tickers_filter=tickers_list)
+    market_ctx = fetch_market_context(use_offline=args.offline)
+    results = run_tracker(
+        cfg=cfg,
+        use_offline=args.offline,
+        tickers_filter=tickers_list,
+        use_sec_edgar=args.sec_edgar,
+    )
     print_terminal_report(results, cfg)
 
     csv_path = Path(args.csv_out).resolve()
     export_csv_report(results, csv_path)
     print(f"💾 已匯出最新 CSV 估值報表：{csv_path}")
 
-    dated_snap, summary_log = archive_weekly_snapshot(results)
-    print(f"🗂️ 已自動歸檔本週歷史快照：{dated_snap}")
-    print(f"📒 已累計寫入每週巡檢日誌：{summary_log}")
+    dated_snap, summary_log = archive_weekly_snapshot(results, use_offline=args.offline)
+    if not args.offline:
+        print(f"🗂️ 已自動歸檔本週歷史快照：{dated_snap}")
+        print(f"📒 已更新每週巡檢日誌（同日自動去重）：{summary_log}")
 
     html_path = Path(args.html_out).resolve()
-    export_html_dashboard(results, cfg, html_path)
+    export_html_dashboard(results, cfg, html_path, market_ctx=market_ctx)
     print(f"🌐 已生成互動式 HTML 視覺化儀表板：{html_path}")
 
     if args.email_to:
@@ -2772,4 +2967,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
