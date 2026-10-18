@@ -1,11 +1,11 @@
 {
-  "smart_portfolio_return_pct": 389.12,
-  "smart_portfolio_cagr_pct": 37.54,
-  "smart_portfolio_win_rate_pct": 90.0,
-  "smart_portfolio_trades": 60,
+  "smart_portfolio_return_pct": 57.04,
+  "smart_portfolio_cagr_pct": 9.49,
+  "smart_portfolio_win_rate_pct": 87.88,
+  "smart_portfolio_trades": 39,
   "spy_return_pct": 82.21,
   "qqq_return_pct": 95.96,
-  "avg_staged_3tier_return_pct": 268.1,
-  "avg_hold_from_entry_return_pct": 344.5,
-  "updated_at": "2026-10-18 22:49:04"
+  "avg_staged_3tier_return_pct": 147.1,
+  "avg_hold_from_entry_return_pct": 269.5,
+  "updated_at": "2026-10-19 01:06:36"
 }

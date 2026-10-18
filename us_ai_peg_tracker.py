@@ -223,6 +223,51 @@ BASELINE_STOCKS: List[StockBaseline] = [
 
 
 # ==============================================================================
+# 2.1 官方 10-K 五年 GAAP Diluted EPS 歷史資料庫 (用於彼得林區五年連續獲利檢驗)
+#     彼得林區 (Peter Lynch) 著作《選股戰略》明訂：PEG 估價前提為「過去五年連續正向獲利」。
+#     真實虧損年份如實記錄負值，嚴禁將虧損掩蓋或覆蓋為正數！
+# ==============================================================================
+FIVE_YEAR_GAAP_EPS_HISTORY: Dict[str, Dict[int, float]] = {
+    "GOOGL": {2020: 2.93, 2021: 5.61, 2022: 4.56, 2023: 5.80, 2024: 8.04, 2025: 10.91},
+    "NVDA":  {2020: 0.17, 2021: 0.38, 2022: 0.17, 2023: 1.19, 2024: 2.94, 2025: 4.06},
+    "NFLX":  {2020: 1.22, 2021: 2.25, 2022: 1.99, 2023: 2.41, 2024: 2.52, 2025: 2.58},
+    "ORCL":  {2020: 3.97, 2021: 2.41, 2022: 3.07, 2023: 3.71, 2024: 4.80, 2025: 5.94},
+    "INTU":  {2020: 6.92, 2021: 7.56, 2022: 7.28, 2023: 8.42, 2024: 10.43, 2025: 14.73},
+    "AVGO":  {2020: 0.66, 2021: 1.50, 2022: 2.65, 2023: 3.29, 2024: 3.90, 2025: 4.90},
+    "ADBE":  {2020: 10.83, 2021: 10.02, 2022: 10.10, 2023: 11.82, 2024: 12.36, 2025: 16.73},
+    "IBM":   {2020: 6.23, 2021: 6.41, 2022: 1.80, 2023: 8.14, 2024: 9.50, 2025: 11.35},
+    "AMZN":  {2020: 2.09, 2021: 3.24, 2022: -0.14, 2023: 2.90, 2024: 5.53, 2025: 7.29},
+    "NOW":   {2020: 0.12, 2021: 0.23, 2022: 0.32, 2023: 1.68, 2024: 1.42, 2025: 1.69},
+    "ACN":   {2020: 7.89, 2021: 9.16, 2022: 10.71, 2023: 10.77, 2024: 11.44, 2025: 12.21},
+    "PANW":  {2020: -0.46, 2021: -0.86, 2022: -0.45, 2023: 1.28, 2024: 1.50, 2025: 1.67},
+    "PLTR":  {2020: -1.20, 2021: -0.27, 2022: -0.18, 2023: 0.09, 2024: 0.22, 2025: 0.69},
+    "CRM":   {2020: 4.38, 2021: 1.48, 2022: 0.21, 2023: 4.20, 2024: 6.20, 2025: 7.56},
+    "TSM":   {2020: 3.39, 2021: 4.12, 2022: 6.57, 2023: 5.18, 2024: 7.05, 2025: 10.60},
+    "MSFT":  {2020: 5.76, 2021: 8.05, 2022: 9.65, 2023: 9.68, 2024: 11.80, 2025: 16.04},
+    "META":  {2020: 10.09, 2021: 13.77, 2022: 8.59, 2023: 14.87, 2024: 21.20, 2025: 23.97},
+    "KLAC":  {2020: 0.77, 2021: 1.34, 2022: 2.10, 2023: 2.42, 2024: 2.60, 2025: 3.46},
+    "ASML":  {2020: 9.99, 2021: 16.58, 2022: 15.09, 2023: 21.42, 2024: 20.80, 2025: 28.52},
+    "AMAT":  {2020: 3.92, 2021: 6.40, 2022: 7.44, 2023: 8.11, 2024: 8.61, 2025: 8.72},
+    "LRCX":  {2020: 1.54, 2021: 2.69, 2022: 3.27, 2023: 3.34, 2024: 2.95, 2025: 4.90},
+    "AAPL":  {2020: 3.28, 2021: 5.61, 2022: 6.11, 2023: 6.13, 2024: 6.08, 2025: 7.92},
+}
+
+
+def check_five_year_consecutive_profit(ticker: str, start_yr: int = 2021, end_yr: int = 2025) -> Tuple[bool, List[int]]:
+    """
+    檢驗標的是否符合彼得林區五年間「每年皆為正獲利 (GAAP Diluted EPS > 0)」。
+    若任一年為負或為零，回傳 (False, [虧損年份清單])。
+    """
+    hist = FIVE_YEAR_GAAP_EPS_HISTORY.get(ticker, {})
+    loss_years: List[int] = []
+    for yr in range(start_yr, end_yr + 1):
+        eps_val = hist.get(yr)
+        if eps_val is None or eps_val <= 0:
+            loss_years.append(yr)
+    return (len(loss_years) == 0), loss_years
+
+
+# ==============================================================================
 # 3. 估值計算結果資料結構
 # ==============================================================================
 @dataclass
@@ -283,6 +328,9 @@ class ValuationResult:
     current_peg_true: float = 0.0 # 目前真實獲利 PEG
     drawdown_from_high_pct: float = 0.0 # 目前距離 52 週高點回檔幅度 (%)
     circuit_breaker_triggered: bool = False # 是否觸發價值陷阱防禦鎖
+    five_year_profitable: bool = True       # 是否通過過去五年連續獲利檢驗 (Peter Lynch PEG 原則)
+    loss_years: List[int] = field(default_factory=list) # 五年間虧損之財年清單
+    sec_eps_applied: bool = False           # 是否已採計 SEC 官方 10-K 資料重新計算 CAGR 與目標價
     fallback_fields: List[str] = field(default_factory=list) # 標記哪些欄位退回使用備援基準
     diagnostic_notes: List[str] = field(default_factory=list)
 
@@ -369,6 +417,17 @@ def fetch_market_context(use_offline: bool = False) -> Dict[str, Any]:
     return ctx
 
 
+def _is_finite_num(v: Any) -> bool:
+    """檢驗數值是否為有效且有限之浮點數或整數 (排除 None, bool, NaN, Inf)"""
+    if v is None or isinstance(v, bool):
+        return False
+    try:
+        f = float(v)
+        return not (math.isnan(f) or math.isinf(f))
+    except (ValueError, TypeError):
+        return False
+
+
 def fetch_live_stock_metrics(
     stock: StockBaseline,
     use_offline: bool = False,
@@ -377,6 +436,7 @@ def fetch_live_stock_metrics(
 ) -> Dict[str, Any]:
     """
     從 yfinance 開源套件抓取單一標的即時報價與財務指標；
+    支援真實虧損保留 (負 EPS、負 FCF 如實記錄，絕不被強制替換為正向備援數值)。
     嚴格追蹤每一個欄位的實際來源，若有部分欄位缺漏或異常而退回基準值，
     於 fallback_fields 與 source 中明確標示「HYBRID (部分備援)」，絕不混充全即時數據。
     """
@@ -417,16 +477,16 @@ def fetch_live_stock_metrics(
         # 關鍵修正：針對雙重股權結構公司（如 GOOGL A+B+C 股），優先使用 impliedSharesOutstanding 總稀釋股數，避免僅除單一類別股數導致每股 FCF 虛胖翻倍
         imp_shares = info.get("impliedSharesOutstanding")
         ord_shares = info.get("sharesOutstanding")
-        if isinstance(imp_shares, (int, float)) and isinstance(ord_shares, (int, float)):
+        if _is_finite_num(imp_shares) and _is_finite_num(ord_shares):
             shares = max(float(imp_shares), float(ord_shares))
         else:
-            shares = imp_shares or ord_shares
+            shares = imp_shares if _is_finite_num(imp_shares) else ord_shares
 
         fin_currency = (info.get("financialCurrency") or "USD").upper()
         quote_currency = (info.get("currency") or "USD").upper()
 
         live_fcf_ps = None
-        if isinstance(free_cf, (int, float)) and isinstance(shares, (int, float)) and shares > 0:
+        if _is_finite_num(free_cf) and _is_finite_num(shares) and float(shares) > 0:
             raw_fcf_ps = float(free_cf) / float(shares)
             if fin_currency != quote_currency and quote_currency == "USD":
                 rate = fx_map.get(fin_currency)
@@ -434,37 +494,43 @@ def fetch_live_stock_metrics(
                     raw_fcf_ps *= rate
                 else:
                     raw_fcf_ps = None
-            # 異常值防護：若拆股調整未同步或口徑差異導致即時 FCF/Share 超過預估盈餘與基準值的 1.75 倍，退回經過驗證之基準 FCF/Share
+            # 關鍵修正：若 FCF 為負數（真實虧損），如實保留！若為正數且超過預估盈餘基準之 1.75 倍，才進行異常防呆
             ref_anchor = max(stock.fallback_fcf_per_share, stock.fallback_forward_eps)
-            if raw_fcf_ps is not None and 0 < raw_fcf_ps <= ref_anchor * 1.75:
-                live_fcf_ps = raw_fcf_ps
+            if raw_fcf_ps is not None:
+                if raw_fcf_ps <= 0:
+                    live_fcf_ps = raw_fcf_ps
+                elif raw_fcf_ps <= ref_anchor * 1.75:
+                    live_fcf_ps = raw_fcf_ps
 
-        if isinstance(live_price, (int, float)) and live_price > 0:
+        if _is_finite_num(live_price) and float(live_price) > 0:
             result["price"] = round(float(live_price), 2)
         else:
             fb_fields.append("股價")
 
-        if isinstance(live_high52, (int, float)) and live_high52 > 0:
+        if _is_finite_num(live_high52) and float(live_high52) > 0:
             result["high52"] = round(float(live_high52), 2)
         else:
             fb_fields.append("52W高點")
 
-        if isinstance(live_low52, (int, float)) and live_low52 > 0:
+        if _is_finite_num(live_low52) and float(live_low52) > 0:
             result["low52"] = round(float(live_low52), 2)
         else:
             fb_fields.append("52W低點")
 
-        if isinstance(live_ttm_eps, (int, float)) and live_ttm_eps > 0:
+        # 關鍵修正：真實負數 GAAP EPS 如實保留，禁止被強制覆蓋為正向備援值！
+        if _is_finite_num(live_ttm_eps):
             result["ttm_eps"] = round(float(live_ttm_eps), 2)
         else:
             fb_fields.append("GAAP_EPS")
 
-        if isinstance(live_forward_eps, (int, float)) and live_forward_eps > 0:
+        # 關鍵修正：Forward EPS 亦如實保留有效數值
+        if _is_finite_num(live_forward_eps):
             result["forward_eps"] = round(float(live_forward_eps), 2)
         else:
             fb_fields.append("Forward_EPS")
 
-        if isinstance(live_fcf_ps, (int, float)) and live_fcf_ps > 0:
+        # 關鍵修正：負每股現金流如實保留
+        if _is_finite_num(live_fcf_ps):
             result["fcf_per_share"] = round(float(live_fcf_ps), 2)
         else:
             fb_fields.append("FCF/Share")
@@ -516,14 +582,32 @@ def evaluate_signal(current_price: float, target_price: float, near_threshold: f
 
 def analyze_stock(stock: StockBaseline, metrics: Dict[str, Any], cfg: ValuationConfig) -> ValuationResult:
     """執行單一標的之三軌估值計算、同源訊號去重、價值陷阱防禦鎖與方法論盲點診斷"""
+    # 0. 檢核 SEC EDGAR 官方資料是否直接參與估價
+    sec_eps_map = metrics.get("sec_edgar_eps")
+    base_eps_val = stock.base_eps
+    latest_eps_val = stock.eps_2025
+    sec_applied = False
+    latest_sec_fy = cfg.latest_fy_year
+    if isinstance(sec_eps_map, dict) and sec_eps_map:
+        if stock.base_year in sec_eps_map and float(sec_eps_map[stock.base_year]) > 0:
+            base_eps_val = float(sec_eps_map[stock.base_year])
+            sec_applied = True
+        latest_sec_fy = max(sec_eps_map.keys())
+        if latest_sec_fy in sec_eps_map and float(sec_eps_map[latest_sec_fy]) > 0:
+            latest_eps_val = float(sec_eps_map[latest_sec_fy])
+            sec_applied = True
+
     # 處理 ORCL 基準年 2019 (規格書原始 CAGR 12.96% 為 N=5 區間驗證值)
     if stock.ticker == "ORCL" and stock.base_year == 2019:
         years_n = 5
     else:
-        years_n = max(1, cfg.latest_fy_year - stock.base_year)
+        years_n = max(1, latest_sec_fy - stock.base_year)
 
-    calc_cagr = calculate_cagr(stock.base_eps, stock.eps_2025, years_n)
-    cagr_pct = round(calc_cagr, 2) if abs(calc_cagr - stock.raw_cagr) < 0.05 else stock.raw_cagr
+    calc_cagr = calculate_cagr(base_eps_val, latest_eps_val, years_n)
+    if sec_applied:
+        cagr_pct = round(calc_cagr, 2)
+    else:
+        cagr_pct = round(calc_cagr, 2) if abs(calc_cagr - stock.raw_cagr) < 0.05 else stock.raw_cagr
 
     # 採計本益比 = min(CAGR, MAX_PE_CAP)
     if cagr_pct < cfg.min_cagr_floor:
@@ -540,10 +624,19 @@ def analyze_stock(stock: StockBaseline, metrics: Dict[str, Any], cfg: ValuationC
     fcf_ps = float(metrics["fcf_per_share"])
     fb_fields: List[str] = list(metrics.get("fallback_fields", []))
 
-    # 【策略一】GAAP 基本面 PEG 7 折目標價
-    s1_ideal = gaap_eps * capped_pe
-    s1_target = s1_ideal * cfg.safety_discount
-    s1_sig, s1_diff = evaluate_signal(price, s1_target, cfg.near_target_threshold)
+    # 彼得林區 (Peter Lynch) 五年連續獲利檢驗 (5-Year Consecutive Positive GAAP EPS)
+    five_year_ok, loss_years = check_five_year_consecutive_profit(stock.ticker, start_yr=2021, end_yr=2025)
+
+    # 【策略一】GAAP 基本面 PEG 7 折目標價 (嚴格檢驗：虧損或未達五年連續獲利者強制無效)
+    if gaap_eps > 0 and five_year_ok:
+        s1_ideal = gaap_eps * capped_pe
+        s1_target = s1_ideal * cfg.safety_discount
+        s1_sig, s1_diff = evaluate_signal(price, s1_target, cfg.near_target_threshold)
+    else:
+        s1_ideal = 0.0
+        s1_target = 0.0
+        s1_sig = "WAIT"
+        s1_diff = 999.9
 
     # 【策略二】52 週高點打 7 折目標價 + 回測有效性檢核
     s2_target = high52 * cfg.safety_discount
@@ -557,9 +650,15 @@ def analyze_stock(stock: StockBaseline, metrics: Dict[str, Any], cfg: ValuationC
         ("FCF/Share", fcf_ps),
     ]
     best_source, true_profit_base = max(candidates, key=lambda x: x[1])
-    s3_ideal = true_profit_base * capped_pe
-    s3_target = s3_ideal * cfg.safety_discount
-    s3_sig, s3_diff = evaluate_signal(price, s3_target, cfg.near_target_threshold)
+    if true_profit_base > 0:
+        s3_ideal = true_profit_base * capped_pe
+        s3_target = s3_ideal * cfg.safety_discount
+        s3_sig, s3_diff = evaluate_signal(price, s3_target, cfg.near_target_threshold)
+    else:
+        s3_ideal = 0.0
+        s3_target = 0.0
+        s3_sig = "WAIT"
+        s3_diff = 999.9
 
     # 計算估值倍數與高點回檔幅度
     current_gaap_pe = (price / gaap_eps) if gaap_eps > 0 else 999.9
@@ -575,10 +674,18 @@ def analyze_stock(stock: StockBaseline, metrics: Dict[str, Any], cfg: ValuationC
     # 0. 資料來源透明度與 SEC EDGAR 驗證提示
     if fb_fields and "BASELINE" not in str(metrics.get("source", "")):
         notes.append(f"📡 欄位透明揭露：即時報價連線成功，惟 [{', '.join(fb_fields)}] 欄位因來源缺漏或異常防呆，自動採用驗證基準值")
-    sec_eps_map = metrics.get("sec_edgar_eps")
-    if isinstance(sec_eps_map, dict) and sec_eps_map:
-        latest_sec_fy = max(sec_eps_map.keys())
-        notes.append(f"🏛️ SEC EDGAR 官方 10-K 年報驗證：FY{latest_sec_fy} 官方 Diluted EPS 為 ${sec_eps_map[latest_sec_fy]:.2f}")
+    if sec_applied:
+        notes.append(f"🏛️ SEC EDGAR 官方 10-K 年報數據直接參與估價：FY{stock.base_year} EPS=${base_eps_val:.2f} → FY{latest_sec_fy} EPS=${latest_eps_val:.2f}，重算後歷史 CAGR 為 {cagr_pct:.2f}%")
+    elif isinstance(sec_eps_map, dict) and sec_eps_map:
+        notes.append(f"🏛️ SEC EDGAR 官方 10-K 年報驗證：FY{latest_sec_fy} 官方 Diluted EPS 為 ${sec_eps_map.get(latest_sec_fy, 0.0):.2f}")
+
+    # 0.1 盈餘真實度與五年連續獲利檢驗揭露
+    if not five_year_ok:
+        notes.append(f"⚠️ 未通過五年連續獲利檢驗：於 {loss_years} 財年出現 GAAP 虧損，違反彼得林區 PEG 核心假設，策略一 (GAAP PEG) 強制停用；即便符合其他策略，倉位亦強制限縮為 30% 試探單")
+    if gaap_eps <= 0:
+        notes.append(f"⛔ 當期 GAAP TTM EPS 呈現虧損 (${gaap_eps:.2f})，無法計算本益比，策略一目標價強制歸零")
+    if true_profit_base <= 0:
+        notes.append(f"⛔ 當期真實獲利基數呈現虧損 (${true_profit_base:.2f})，策略三目標價強制歸零")
 
     # 1. 決定該標的之「推薦主策略 (Recommended Anchor)」
     if stock.sector_type == "SAAS_SBC":
@@ -608,7 +715,7 @@ def analyze_stock(stock: StockBaseline, metrics: Dict[str, Any], cfg: ValuationC
         notes.append("半導體設備具景氣循環特性：高峰期 EPS 與高點回檔需搭配晶圓廠資本支出 (Capex) 週期綜合判斷")
     else:
         rec_strategy = "策略一/三 (基本面PEG)"
-        rec_target = s1_target if (gaap_eps / true_profit_base) >= 0.85 else s3_target
+        rec_target = s1_target if (gaap_eps / true_profit_base) >= 0.85 and s1_target > 0 else s3_target
         rec_sig, rec_diff = evaluate_signal(price, rec_target, cfg.near_target_threshold)
 
     # 2. 診斷本益比封頂保護是否啟動
@@ -628,62 +735,73 @@ def analyze_stock(stock: StockBaseline, metrics: Dict[str, Any], cfg: ValuationC
         notes.append(f"⚠️ 帳面盈餘衰退或重組：當期 TTM EPS (${gaap_eps:.2f}) 低於 2025 基準 (${stock.eps_2025:.2f})，請改以策略三 ({best_source}) 評估並留意價值陷阱")
 
     # 5. 綜合燈號判定、「同源訊號去重」與「一二三軌金字塔分批投入資金 %」計算
-    s1_buy = (s1_sig == "BUY")
-    s2_buy = (s2_sig == "BUY" and s2_valid)
-    s3_buy = (s3_sig == "BUY")
-
-    # 關鍵修正：同源訊號去重保護（若策略一與策略三目標價差距 < 3%，代表兩者使用相同或幾乎相同的獲利基數，在未觸發策略二時合併視為 1 軌基本面訊號，避免虛增至 60% 倉位）
-    same_fundamental_base = abs(s3_target - s1_target) / max(1.0, s1_target) < 0.03
-    triggered_buys: List[str] = []
-    if s1_buy and s3_buy and same_fundamental_base and not s2_buy:
-        triggered_buys.append("策略一/三(同源獲利)")
-        notes.append(f"📌 同源訊號去重保護：策略一 (${s1_target:.2f}) 與策略三 (${s3_target:.2f}) 採計極相近之獲利基數，合併計為 1 軌獨立基本面訊號，避免重複加權")
+    # 關鍵修正：若全體獲利指標皆為虧損 (GAAP <= 0 且 真實獲利 <= 0)，觸發「虧損禁買防禦」，全面禁止買進
+    if gaap_eps <= 0 and true_profit_base <= 0:
+        overall_signal = "⛔ 虧損禁買 (0軌)"
+        alloc_suggest = "⛔ 0% (每股盈餘/現金流虧損，嚴禁進場)"
+        matched_cnt = 0
+        circuit_breaker_triggered = True
+        notes.append("⛔ 虧損禁買防禦：標的當前無實質盈餘與現金流，完全不符合價值投資進場前提，嚴禁開倉！")
     else:
-        if s1_buy:
-            triggered_buys.append("策略一")
-        if s2_buy:
-            triggered_buys.append("策略二")
-        if s3_buy:
-            triggered_buys.append("策略三")
+        s1_buy = (s1_sig == "BUY" and s1_target > 0)
+        s2_buy = (s2_sig == "BUY" and s2_valid)
+        s3_buy = (s3_sig == "BUY" and s3_target > 0)
 
-    matched_cnt = len(triggered_buys)
-    any_near = (s1_sig == "NEAR") or (s3_sig == "NEAR") or (s2_sig == "NEAR" and s2_valid)
-
-    # 價值陷阱防禦鎖：若雖然觸發 2~3 軌，但當期盈餘嚴重衰退或深度崩跌超過 45%，強制鎖定試單上限 30%
-    circuit_breaker_triggered = (matched_cnt >= 2) and (is_earnings_contracting or drawdown_pct <= -45.0)
-    if circuit_breaker_triggered:
-        notes.append("🛡️ 觸發【價值陷阱防禦鎖】：雖多軌價格達標，但因盈餘衰退或深度破底，系統強制將建議投入上限鎖定為 30% 試單倉（佔總資產 1.5%），待下季財報止穩再解鎖加碼")
-
-    if matched_cnt == 3:
-        overall_signal = f"🔥 3軌全滿 ({'/'.join(triggered_buys)})" if not circuit_breaker_triggered else f"⚠️ 3軌觸發但啟動防禦鎖 ({'/'.join(triggered_buys)})"
-        if circuit_breaker_triggered:
-            alloc_suggest = "🛡️ 鎖定單股額度 30% (價值陷阱防禦鎖啟動)"
+        # 同源訊號去重保護（若策略一與策略三目標價差距 < 3%，代表兩者使用相同獲利基數，在未觸發策略二時合併視為 1 軌基本面訊號）
+        same_fundamental_base = (s1_target > 0 and s3_target > 0 and abs(s3_target - s1_target) / max(1.0, s1_target) < 0.03)
+        triggered_buys: List[str] = []
+        if s1_buy and s3_buy and same_fundamental_base and not s2_buy:
+            triggered_buys.append("策略一/三(同源獲利)")
+            notes.append(f"📌 同源訊號去重保護：策略一 (${s1_target:.2f}) 與策略三 (${s3_target:.2f}) 採計極相近之獲利基數，合併計為 1 軌獨立基本面訊號，避免重複加權")
         else:
-            alloc_suggest = "🔥 投入單股額度 100% (佔總資產上限 5%)"
-    elif matched_cnt == 2:
-        overall_signal = f"🟢🟢 2軌達標 ({'/'.join(triggered_buys)})" if not circuit_breaker_triggered else f"⚠️ 2軌觸發但啟動防禦鎖 ({'/'.join(triggered_buys)})"
-        if circuit_breaker_triggered:
-            alloc_suggest = "🛡️ 鎖定單股額度 30% (價值陷阱防禦鎖啟動)"
-        else:
-            alloc_suggest = "🟢🟢 投入單股額度 60% (佔總資產 3%)"
-    elif matched_cnt == 1:
-        overall_signal = f"🟢 1軌達標 ({triggered_buys[0]})"
-        alloc_suggest = "🟢 投入單股額度 30% (佔總資產 1.5%)"
-    elif any_near:
-        triggered_nears = []
-        if s1_sig == "NEAR":
-            triggered_nears.append("策略一")
-        if s2_sig == "NEAR":
-            triggered_nears.append("策略二")
-        if s3_sig == "NEAR":
-            triggered_nears.append("策略三")
-        overall_signal = f"🟡 接近預警 ({'/'.join(triggered_nears)})"
-        alloc_suggest = "🟡 0% (SHV短債待命，距買點+10%內)"
-    else:
-        overall_signal = "⚪ 觀望等待"
-        alloc_suggest = "⚪ 0% (續抱底倉/SHV領息)"
+            if s1_buy:
+                triggered_buys.append("策略一")
+            if s2_buy:
+                triggered_buys.append("策略二")
+            if s3_buy:
+                triggered_buys.append("策略三")
 
-    fair_sell_100 = (rec_target / cfg.safety_discount) if cfg.safety_discount > 0 else rec_target * 1.4286
+        matched_cnt = len(triggered_buys)
+        any_near = (s1_sig == "NEAR") or (s3_sig == "NEAR") or (s2_sig == "NEAR" and s2_valid)
+
+        # 價值陷阱防禦鎖：若雖然觸發 2~3 軌，但當期盈餘嚴重衰退或深度崩跌超過 45%，強制鎖定試單上限 30%
+        circuit_breaker_triggered = (matched_cnt >= 2) and (is_earnings_contracting or drawdown_pct <= -45.0)
+        if circuit_breaker_triggered:
+            notes.append("🛡️ 觸發【價值陷阱防禦鎖】：雖多軌價格達標，但因盈餘衰退或深度破底，系統強制將建議投入上限鎖定為 30% 試單倉（佔總資產 1.5%），待下季財報止穩再解鎖加碼")
+
+        if not five_year_ok and matched_cnt > 0:
+            overall_signal = f"⚠️ 未滿五年獲利 ({'/'.join(triggered_buys)})"
+            alloc_suggest = "⚠️ 鎖定單股額度 30% (未達五年連續獲利標準)"
+        elif matched_cnt == 3:
+            overall_signal = f"🔥 3軌全滿 ({'/'.join(triggered_buys)})" if not circuit_breaker_triggered else f"⚠️ 3軌觸發但啟動防禦鎖 ({'/'.join(triggered_buys)})"
+            if circuit_breaker_triggered:
+                alloc_suggest = "🛡️ 鎖定單股額度 30% (價值陷阱防禦鎖啟動)"
+            else:
+                alloc_suggest = "🔥 投入單股額度 100% (佔總資產上限 5%)"
+        elif matched_cnt == 2:
+            overall_signal = f"🟢🟢 2軌達標 ({'/'.join(triggered_buys)})" if not circuit_breaker_triggered else f"⚠️ 2軌觸發但啟動防禦鎖 ({'/'.join(triggered_buys)})"
+            if circuit_breaker_triggered:
+                alloc_suggest = "🛡️ 鎖定單股額度 30% (價值陷阱防禦鎖啟動)"
+            else:
+                alloc_suggest = "🟢🟢 投入單股額度 60% (佔總資產 3%)"
+        elif matched_cnt == 1:
+            overall_signal = f"🟢 1軌達標 ({triggered_buys[0]})"
+            alloc_suggest = "🟢 投入單股額度 30% (佔總資產 1.5%)"
+        elif any_near:
+            triggered_nears = []
+            if s1_sig == "NEAR":
+                triggered_nears.append("策略一")
+            if s2_sig == "NEAR":
+                triggered_nears.append("策略二")
+            if s3_sig == "NEAR":
+                triggered_nears.append("策略三")
+            overall_signal = f"🟡 接近預警 ({'/'.join(triggered_nears)})"
+            alloc_suggest = "🟡 0% (SHV短債待命，距買點+10%內)"
+        else:
+            overall_signal = "⚪ 觀望等待"
+            alloc_suggest = "⚪ 0% (續抱底倉/SHV領息)"
+
+    fair_sell_100 = (rec_target / cfg.safety_discount) if cfg.safety_discount > 0 and rec_target > 0 else 0.0
     overheated_sell_120 = fair_sell_100 * 1.20
 
     return ValuationResult(
@@ -693,8 +811,8 @@ def analyze_stock(stock: StockBaseline, metrics: Dict[str, Any], cfg: ValuationC
         sector_type=stock.sector_type,
         data_source=metrics.get("source", metrics.get("data_source", "LIVE")),
         base_year=stock.base_year,
-        base_eps=stock.base_eps,
-        eps_2025=stock.eps_2025,
+        base_eps=round(base_eps_val, 2),
+        eps_2025=round(latest_eps_val, 2),
         years_n=years_n,
         cagr_pct=round(cagr_pct, 2),
         capped_pe=round(capped_pe, 2),
@@ -732,6 +850,9 @@ def analyze_stock(stock: StockBaseline, metrics: Dict[str, Any], cfg: ValuationC
         current_peg_true=round(current_peg_true, 2),
         drawdown_from_high_pct=round(drawdown_pct, 2),
         circuit_breaker_triggered=circuit_breaker_triggered,
+        five_year_profitable=five_year_ok,
+        loss_years=loss_years,
+        sec_eps_applied=sec_applied,
         fallback_fields=fb_fields,
         diagnostic_notes=notes,
     )
@@ -810,12 +931,13 @@ def export_csv_report(results: List[ValuationResult], output_path: Path) -> None
         "【策略一】GAAP帳面7折買進價 ($)", "策略一差距 (%)", "策略一訊號",
         "【策略二】52週高點7折買進價 ($)", "策略二差距 (%)", "策略二歷史曾觸及 (>=52W低點)", "策略二訊號",
         "【策略三】真實現金流7折買進價 ($)", "策略三差距 (%)", "策略三訊號",
+        "五年連續獲利檢核 (Peter Lynch)", "SEC EDGAR 官方10-K參與重算",
         "歷史年均複合成長率 CAGR (%)", "採計本益比上限 (最高45倍)", "打7折後目標本益比 (最高31.5倍)",
         "52週最高價 ($)", "52週最低價 ($)", "目前距52週高點跌幅 (%)",
         "帳面當期盈餘 GAAP TTM EPS ($)", "分析師預估遠期盈餘 Forward EPS ($)", "每股自由現金流 FCF/Share ($)",
         "策略三採計真實獲利基數 ($)", "真實獲利指標來源",
         "目前帳面本益比 (GAAP PE)", "目前真實獲利本益比 (True PE)", "目前真實本益成長比 (True PEG)",
-        "個股盲點與風險診斷白話提示"
+        "價值陷阱防禦鎖啟動", "個股盲點與風險診斷白話提示"
     ]
 
     with output_path.open("w", encoding="utf-8-sig", newline="") as f:
@@ -846,6 +968,8 @@ def export_csv_report(results: List[ValuationResult], output_path: Path) -> None
                 "【策略三】真實現金流7折買進價 ($)": r.s3_target_price,
                 "策略三差距 (%)": r.s3_diff_pct,
                 "策略三訊號": r.s3_signal,
+                "五年連續獲利檢核 (Peter Lynch)": "符合 (連續5年獲利)" if r.five_year_profitable else f"未通過 (虧損年份:{r.loss_years})",
+                "SEC EDGAR 官方10-K參與重算": "已直接重算" if r.sec_eps_applied else "使用基準/即時",
                 "歷史年均複合成長率 CAGR (%)": r.cagr_pct,
                 "採計本益比上限 (最高45倍)": r.capped_pe,
                 "打7折後目標本益比 (最高31.5倍)": r.discounted_pe,
@@ -860,6 +984,7 @@ def export_csv_report(results: List[ValuationResult], output_path: Path) -> None
                 "目前帳面本益比 (GAAP PE)": r.current_gaap_pe,
                 "目前真實獲利本益比 (True PE)": r.current_true_pe,
                 "目前真實本益成長比 (True PEG)": r.current_peg_true,
+                "價值陷阱防禦鎖啟動": "是 (強制鎖定30%試單)" if r.circuit_breaker_triggered else "否",
                 "個股盲點與風險診斷白話提示": "；".join(r.diagnostic_notes),
             })
 

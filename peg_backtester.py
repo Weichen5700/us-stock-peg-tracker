@@ -83,7 +83,7 @@ HISTORICAL_PIT_EPS_DB: Dict[str, Dict[int, Tuple[float, float]]] = {
     },
     "AMZN": {
         2016: (0.25, 0.85), 2017: (0.31, 0.95), 2018: (1.01, 1.95), 2019: (1.15, 2.60),
-        2020: (2.09, 3.10), 2021: (3.24, 3.60), 2022: (0.20, 2.10), 2023: (2.90, 4.10),
+        2020: (2.09, 3.10), 2021: (3.24, 3.60), 2022: (-0.14, 2.10), 2023: (2.90, 4.10),
         2024: (5.53, 6.80), 2025: (7.29, 9.50), 2026: (12.43, 13.80),
     },
     "NOW": {
@@ -98,12 +98,12 @@ HISTORICAL_PIT_EPS_DB: Dict[str, Dict[int, Tuple[float, float]]] = {
     },
     "PANW": {
         2016: (0.10, 0.85), 2017: (0.12, 1.15), 2018: (0.15, 1.55), 2019: (0.20, 1.95),
-        2020: (0.25, 2.45), 2021: (0.30, 3.10), 2022: (0.40, 4.20), 2023: (1.28, 5.60),
+        2020: (-0.46, 2.45), 2021: (-0.86, 3.10), 2022: (-0.45, 4.20), 2023: (1.28, 5.60),
         2024: (1.50, 7.20), 2025: (1.67, 8.90), 2026: (0.40, 10.50),
     },
     "PLTR": {
         2016: (0.02, 0.04), 2017: (0.02, 0.05), 2018: (0.03, 0.06), 2019: (0.03, 0.08),
-        2020: (0.04, 0.12), 2021: (0.05, 0.16), 2022: (0.06, 0.22), 2023: (0.09, 0.35),
+        2020: (-1.20, 0.12), 2021: (-0.27, 0.16), 2022: (-0.18, 0.22), 2023: (0.09, 0.35),
         2024: (0.22, 0.65), 2025: (0.69, 1.25), 2026: (1.17, 2.15),
     },
     "CRM": {
@@ -191,6 +191,10 @@ class TradeRecord:
     total_fee_usd: float
     net_profit_usd: float
     net_return_pct: float
+    matched_tracks: int = 1               # 進場時滿足之有效獨立軌數 (1, 2, 3)
+    circuit_breaker_active: bool = False  # 是否觸發價值陷阱防禦鎖或未達5年獲利限制
+    holding_max_drawdown_pct: float = 0.0 # 持倉期間最大回撤浮虧 (MDD %)
+    one_year_return_pct: float = 0.0      # 進場持有滿 1 年 (252交易日) 之實際報酬率 (%)
 
 
 @dataclass
@@ -279,91 +283,137 @@ def build_historical_target_series(
     bt_cfg: BacktestConfig,
 ) -> pd.DataFrame:
     """
-    為單一股票建構 2021-10 至 2026-10 每個交易日 t 的「當下已知時點 (Point-in-Time)」估值：
-    - 滾動 52 週最高價 (high52) 與最低價 (low52)
-    - 僅使用截至 t 時點已公布之過去 5 年財報計算滾動 CAGR(t) 與 TTM EPS(t)，絕不偷看未來年份！
+    為單一股票建構 2021-10 至 2026-10 每個交易日 t 的「嚴格因果時點 (Point-in-Time, PIT)」估值序列：
+    - 【徹底根除前視偏差與線性插值 (Zero Look-Ahead / No Interpolation)】：
+      上市公司財年 Y 之 10-K 年報官方公告日統一定為隔年 3 月 15 日 (datetime.date(Y + 1, 3, 15))。
+      在交易日 t 當下，只能使用公告日 <= t 之最新已公告財年數據，新財報公告前維持恆定階梯數值 (Step-Function Forward-Fill)，嚴禁任何線性插值！
+    - 【彼得林區五年連續獲利檢驗】：若過去 5 年內有任一年 GAAP Diluted EPS <= 0，策略一強制停用 (目標價歸零)。
+    - 【規則全面統一】：移除回測中私設之 25x/22x PE 濾網，智慧定錨邏輯完全與主系統對齊。
     """
     dates = price_series.index
-    years_float = np.array([d.year + (d.dayofyear - 1) / 365.25 for d in dates], dtype=float)
-
-    # 計算滾動 252 交易日 (52週) 最高價與最低價
     high52 = price_series.rolling(window=252, min_periods=60).max()
     low52 = price_series.rolling(window=252, min_periods=60).min()
 
     pit_db = HISTORICAL_PIT_EPS_DB.get(stock.ticker, {})
     sorted_yrs = sorted(pit_db.keys())
 
-    # 建立因果時點 (Causal Point-in-Time) 錨點：每個完整財年 Y 的年報約於 Y+0.20 時點已知
-    pit_x: List[float] = []
-    pit_gaap_y: List[float] = []
-    pit_true_y: List[float] = []
-    pit_cagr_y: List[float] = []
+    gaap_eps_arr: List[float] = []
+    true_eps_arr: List[float] = []
+    capped_pe_arr: List[float] = []
+    s1_target_arr: List[float] = []
+    s2_target_arr: List[float] = []
+    s2_valid_arr: List[bool] = []
+    s3_target_arr: List[float] = []
+    smart_target_arr: List[float] = []
+    anchor_name_arr: List[str] = []
+    contracting_arr: List[bool] = []
+    five_year_ok_arr: List[bool] = []
 
-    for yr in sorted_yrs:
-        g_eps, t_eps = pit_db[yr]
-        # 計算在 yr 當時已知的「過去 5 年滾動 CAGR」(即 yr-5 -> yr)，絕不使用 yr 之後的未來數據！
-        prev_yr = yr - 5
-        if prev_yr in pit_db:
-            base_g, base_t = pit_db[prev_yr]
-            # 取真實獲利或帳面獲利之 5 年滾動成長率
-            cagr_g = calculate_cagr(max(0.02, base_g), max(0.05, g_eps), 5)
-            cagr_t = calculate_cagr(max(0.04, base_t), max(0.08, t_eps), 5)
-            rolling_cagr = max(cagr_g, cagr_t)
+    for idx, d in enumerate(dates):
+        dt = pd.to_datetime(d).date()
+        # 尋找在交易日 dt 當日市場已官方知悉 (公告生效日 Y+1-03-15 <= dt) 之最新財年
+        eligible_yrs = [yr for yr in sorted_yrs if datetime.date(yr + 1, 3, 15) <= dt]
+        if eligible_yrs:
+            y_known = max(eligible_yrs)
         else:
+            y_known = min(sorted_yrs)
+
+        g_eps, t_eps = pit_db[y_known]
+
+        # 檢驗彼得林區 (Peter Lynch) 五年連續獲利原則 (y_known-4 到 y_known 連續 5 年皆為正)
+        check_yrs = range(y_known - 4, y_known + 1)
+        five_yr_ok = all(yr in pit_db and pit_db[yr][0] > 0 for yr in check_yrs)
+
+        # 滾動 5 年 CAGR 計算 (y_known - 5 -> y_known，絕不偷看未來！)
+        prev_yr = y_known - 5
+        if prev_yr in pit_db and pit_db[prev_yr][0] > 0 and g_eps > 0:
+            cagr_g = calculate_cagr(pit_db[prev_yr][0], g_eps, 5)
+        else:
+            cagr_g = 0.0
+
+        if prev_yr in pit_db and pit_db[prev_yr][1] > 0 and t_eps > 0:
+            cagr_t = calculate_cagr(pit_db[prev_yr][1], t_eps, 5)
+        else:
+            cagr_t = 0.0
+
+        rolling_cagr = max(cagr_g, cagr_t)
+        if rolling_cagr <= 0:
             rolling_cagr = stock.raw_cagr
 
-        pit_x.append(float(yr) + 0.20)
-        pit_gaap_y.append(max(0.05, g_eps))
-        pit_true_y.append(max(0.08, t_eps, g_eps))
-        pit_cagr_y.append(min(max(rolling_cagr, 5.0), bt_cfg.max_pe_cap))
+        capped_pe = min(max(rolling_cagr, 5.0), bt_cfg.max_pe_cap)
+        disc_pe = capped_pe * bt_cfg.safety_discount
 
-    # 僅在當下已發生的時間點之間進行平滑滾動四季移動（時間軸單向往後，無未來資訊洩漏）
-    gaap_eps_t = np.exp(np.interp(years_float, pit_x, np.log(pit_gaap_y)))
-    true_eps_t = np.exp(np.interp(years_float, pit_x, np.log(pit_true_y)))
-    true_eps_t = np.maximum(true_eps_t, gaap_eps_t)
-    capped_pe_t = np.interp(years_float, pit_x, pit_cagr_y)
-    disc_pe_t = capped_pe_t * bt_cfg.safety_discount
-
-    # 計算三軌 7 折目標價 (隨當下已知 EPS 與當下滾動 CAGR 動態演化)
-    s1_target = gaap_eps_t * disc_pe_t
-    s2_target = high52.values * bt_cfg.safety_discount
-    s2_valid = s2_target >= low52.values
-    s3_target = true_eps_t * disc_pe_t
-
-    # 智慧三軌定錨目標價 (Smart Sector-Specific Anchor Target)
-    if stock.sector_type == "MATURE_MOAT":
-        smart_target = s2_target
-        anchor_name = "策略二 (52W高點7折防踏空)"
-    elif stock.sector_type == "SAAS_SBC":
-        if stock.raw_cagr >= 20.0:
-            smart_target = s3_target
-            anchor_name = "策略三 (Forward/FCF真實獲利7折)"
+        # 策略一：若當期 GAAP EPS <= 0 或未通過五年連續獲利檢驗，策略一目標價強制歸零
+        if g_eps > 0 and five_yr_ok:
+            s1_t = g_eps * disc_pe
         else:
-            pe_filtered_s2 = np.minimum(s2_target, true_eps_t * 25.0)
-            smart_target = np.maximum(s3_target, pe_filtered_s2)
-            anchor_name = "策略三 + 25xPE濾網策略二"
-    elif stock.sector_type == "SEMI_EQUIP":
-        pe_filtered_s2 = np.minimum(s2_target, true_eps_t * 22.0)
-        smart_target = np.maximum(s3_target, pe_filtered_s2)
-        anchor_name = "策略三 + 週期PE濾網"
-    else:
-        smart_target = np.maximum(s1_target, s3_target)
-        anchor_name = "策略一/三 (基本面真實PEG 7折)"
+            s1_t = 0.0
+
+        # 策略二：滾動 52 週高點 7 折
+        h52_val = float(high52.iloc[idx]) if not math.isnan(high52.iloc[idx]) else float(price_series.iloc[idx])
+        l52_val = float(low52.iloc[idx]) if not math.isnan(low52.iloc[idx]) else float(price_series.iloc[idx])
+        s2_t = h52_val * bt_cfg.safety_discount
+        s2_v = (s2_t >= l52_val)
+
+        # 策略三：若真實獲利基數 <= 0，策略三目標價強制歸零
+        if t_eps > 0:
+            s3_t = t_eps * disc_pe
+        else:
+            s3_t = 0.0
+
+        # 智慧三軌定錨目標價 (完全對齊主系統邏輯，杜絕私設本益比濾網)
+        if stock.sector_type == "MATURE_MOAT":
+            smart_t = s2_t
+            anchor_name = "策略二 (52W高點7折防踏空)"
+        elif stock.sector_type == "SAAS_SBC":
+            if rolling_cagr >= 25.0:
+                smart_t = s3_t
+                anchor_name = "策略三 (Forward/FCF真實獲利7折)"
+            else:
+                smart_t = max(s2_t, s3_t) if s2_v else s3_t
+                anchor_name = "策略二/三 雙軌定錨"
+        elif stock.sector_type == "SEMI_EQUIP":
+            smart_t = s3_t
+            anchor_name = "策略三 (週期檢核)"
+        else:
+            smart_t = s1_t if (t_eps > 0 and (g_eps / t_eps) >= 0.85 and s1_t > 0) else s3_t
+            anchor_name = "策略一/三 (基本面真實PEG 7折)"
+
+        # 當期盈餘衰退檢核 (較前一年度衰退超過 20%)
+        prev_yr_data = pit_db.get(y_known - 1)
+        if prev_yr_data and prev_yr_data[0] > 0:
+            is_contracting = (g_eps < prev_yr_data[0] * 0.80)
+        else:
+            is_contracting = False
+
+        gaap_eps_arr.append(g_eps)
+        true_eps_arr.append(t_eps)
+        capped_pe_arr.append(capped_pe)
+        s1_target_arr.append(s1_t)
+        s2_target_arr.append(s2_t)
+        s2_valid_arr.append(s2_v)
+        s3_target_arr.append(s3_t)
+        smart_target_arr.append(smart_t)
+        anchor_name_arr.append(anchor_name)
+        contracting_arr.append(is_contracting)
+        five_year_ok_arr.append(five_yr_ok)
 
     df_out = pd.DataFrame(
         {
             "close": price_series.values,
             "high52": high52.values,
             "low52": low52.values,
-            "gaap_eps": gaap_eps_t,
-            "true_eps": true_eps_t,
-            "capped_pe": capped_pe_t,
-            "s1_target": s1_target,
-            "s2_target": s2_target,
-            "s2_valid": s2_valid,
-            "s3_target": s3_target,
-            "smart_target": smart_target,
-            "anchor_name": anchor_name,
+            "gaap_eps": gaap_eps_arr,
+            "true_eps": true_eps_arr,
+            "capped_pe": capped_pe_arr,
+            "s1_target": s1_target_arr,
+            "s2_target": s2_target_arr,
+            "s2_valid": s2_valid_arr,
+            "s3_target": s3_target_arr,
+            "smart_target": smart_target_arr,
+            "anchor_name": anchor_name_arr,
+            "is_contracting": contracting_arr,
+            "five_year_ok": five_year_ok_arr,
         },
         index=dates,
     )
@@ -437,9 +487,10 @@ def simulate_stock_trades(
     trade_size_usd: float = 10000.0,
 ) -> Tuple[List[TradeRecord], StockBacktestSummary]:
     """
-    針對單一股票模擬過去 5 年每當 `收盤價 <= 當時已知7折目標價` 時買進，
-    並在 `收盤價 >= 當時10折合理價` 或滿 1 年獲利達標時賣出，嚴格扣除雙邊手續費。
-    同時計算該股若採「三階段賣出法」與「買進後抱緊不賣」之對照報酬率。
+    針對單一股票模擬過去 5 年每當 `收盤價 <= 當時已知7折目標價` 時買進：
+    - 嚴格落實「一二三軌部位金字塔階梯 (30%/60%/100%)」與「價值陷阱防禦鎖 (盈餘衰退或回檔>45%強制鎖定30%)」。
+    - 嚴格追蹤持倉期間之最大回撤浮虧 (holding_max_drawdown_pct) 與進場後滿 1 年之真實報酬率 (one_year_return_pct)。
+    - 在 `收盤價 >= 當時10折合理價` 或滿 1 年獲利達標時賣出，嚴格扣除雙邊手續費。
     """
     trades: List[TradeRecord] = []
     dates = hist_df.index
@@ -450,6 +501,9 @@ def simulate_stock_trades(
     entry_idx = 0
     entry_price = 0.0
     entry_target = 0.0
+    actual_invest_usd = trade_size_usd
+    matched_tracks = 1
+    cb_active = False
     last_exit_idx = -bt_cfg.min_hold_cooldown
 
     for i in range(len(dates)):
@@ -464,6 +518,39 @@ def simulate_stock_trades(
                 entry_idx = i
                 entry_price = price
                 entry_target = target
+
+                # 計算進場時滿足之有效獨立軌數與防禦鎖狀態
+                s1_t_val = float(hist_df["s1_target"].iloc[i])
+                s2_t_val = float(hist_df["s2_target"].iloc[i])
+                s2_v_val = bool(hist_df["s2_valid"].iloc[i])
+                s3_t_val = float(hist_df["s3_target"].iloc[i])
+                h52_val = float(hist_df["high52"].iloc[i])
+                is_cont = bool(hist_df["is_contracting"].iloc[i])
+                five_ok = bool(hist_df["five_year_ok"].iloc[i])
+
+                s1_b = (price <= s1_t_val and s1_t_val > 0)
+                s2_b = (price <= s2_t_val and s2_v_val)
+                s3_b = (price <= s3_t_val and s3_t_val > 0)
+
+                same_base = (s1_t_val > 0 and s3_t_val > 0 and abs(s3_t_val - s1_t_val) / max(1.0, s1_t_val) < 0.03)
+                if s1_b and s3_b and same_base and not s2_b:
+                    matched_tracks = 1
+                else:
+                    matched_tracks = sum([s1_b, s2_b, s3_b])
+                if matched_tracks == 0:
+                    matched_tracks = 1
+
+                dd_h = ((price - h52_val) / h52_val) if h52_val > 0 else 0.0
+                cb_active = (matched_tracks >= 2 and (is_cont or dd_h <= -0.45)) or (not five_ok)
+
+                if cb_active or not five_ok or matched_tracks <= 1:
+                    alloc_ratio = 0.30
+                elif matched_tracks == 2:
+                    alloc_ratio = 0.60
+                else:
+                    alloc_ratio = 1.00
+
+                actual_invest_usd = trade_size_usd * alloc_ratio
         else:
             hold_days = i - entry_idx
             # 僅使用進場時點之合理價 (entry_target / 0.70) 作為純粹均值回歸停利標準，不偷看未來目標價
@@ -479,15 +566,25 @@ def simulate_stock_trades(
                 exit_reason = "期末持有結算"
 
             if exit_reason:
-                entry_fee = trade_size_usd * bt_cfg.fee_rate_one_way
-                shares_bought = (trade_size_usd - entry_fee) / entry_price
+                entry_fee = actual_invest_usd * bt_cfg.fee_rate_one_way
+                shares_bought = (actual_invest_usd - entry_fee) / entry_price
                 gross_exit_val = shares_bought * price
                 exit_fee = gross_exit_val * bt_cfg.fee_rate_one_way
                 net_exit_val = gross_exit_val - exit_fee
 
                 total_fee = entry_fee + exit_fee
-                net_profit = net_exit_val - trade_size_usd
-                net_ret_pct = (net_profit / trade_size_usd) * 100.0
+                net_profit = net_exit_val - actual_invest_usd
+                net_ret_pct = (net_profit / actual_invest_usd) * 100.0
+
+                # 計算持倉期間最大回撤 (浮虧最大值 %)
+                hold_closes = closes[entry_idx : i + 1]
+                min_hold_p = float(np.min(hold_closes))
+                holding_mdd_pct = ((min_hold_p - entry_price) / entry_price) * 100.0
+
+                # 計算進場持有滿 1 年 (252交易日) 之實際報酬率 (%)
+                idx_1y = min(entry_idx + 252, len(closes) - 1)
+                p_1y = float(closes[idx_1y])
+                one_year_ret_pct = ((p_1y * (1.0 - bt_cfg.fee_rate_one_way)) / (entry_price * (1.0 + bt_cfg.fee_rate_one_way)) - 1.0) * 100.0
 
                 trades.append(
                     TradeRecord(
@@ -501,11 +598,15 @@ def simulate_stock_trades(
                         exit_price=round(price, 2),
                         exit_reason=exit_reason,
                         holding_days=int(hold_days),
-                        invested_amount=trade_size_usd,
+                        invested_amount=round(actual_invest_usd, 2),
                         gross_return_pct=round(gross_ret * 100.0, 2),
                         total_fee_usd=round(total_fee, 2),
                         net_profit_usd=round(net_profit, 2),
                         net_return_pct=round(net_ret_pct, 2),
+                        matched_tracks=matched_tracks,
+                        circuit_breaker_active=cb_active,
+                        holding_max_drawdown_pct=round(holding_mdd_pct, 2),
+                        one_year_return_pct=round(one_year_ret_pct, 2),
                     )
                 )
                 in_position = False
@@ -627,10 +728,45 @@ def run_portfolio_simulation(
                     candidates.append((discount_depth, tk, price, target))
 
             candidates.sort(key=lambda x: x[0])
+            base_slot_cap = bt_cfg.initial_capital / bt_cfg.max_positions
             for _, tk, price, target in candidates[:open_slots]:
-                slot_alloc = cash / max(1, (bt_cfg.max_positions - len(positions)))
+                df_tk = all_hist[tk]
+                # 對齊一二三軌金字塔配置與防禦鎖
+                s1_t_val = float(df_tk["s1_target"].iloc[i])
+                s2_t_val = float(df_tk["s2_target"].iloc[i])
+                s2_v_val = bool(df_tk["s2_valid"].iloc[i])
+                s3_t_val = float(df_tk["s3_target"].iloc[i])
+                h52_val = float(df_tk["high52"].iloc[i])
+                is_cont = bool(df_tk["is_contracting"].iloc[i])
+                five_ok = bool(df_tk["five_year_ok"].iloc[i])
+
+                s1_b = (price <= s1_t_val and s1_t_val > 0)
+                s2_b = (price <= s2_t_val and s2_v_val)
+                s3_b = (price <= s3_t_val and s3_t_val > 0)
+
+                same_base = (s1_t_val > 0 and s3_t_val > 0 and abs(s3_t_val - s1_t_val) / max(1.0, s1_t_val) < 0.03)
+                if s1_b and s3_b and same_base and not s2_b:
+                    m_cnt = 1
+                else:
+                    m_cnt = sum([s1_b, s2_b, s3_b])
+                if m_cnt == 0:
+                    m_cnt = 1
+
+                dd_h = ((price - h52_val) / h52_val) if h52_val > 0 else 0.0
+                cb_active = (m_cnt >= 2 and (is_cont or dd_h <= -0.45)) or (not five_ok)
+
+                if cb_active or not five_ok or m_cnt <= 1:
+                    size_pct = 0.30
+                elif m_cnt == 2:
+                    size_pct = 0.60
+                else:
+                    size_pct = 1.00
+
+                target_alloc = base_slot_cap * size_pct
+                slot_alloc = min(cash, target_alloc)
                 if slot_alloc < 1000.0:
-                    break
+                    continue
+
                 entry_fee = slot_alloc * bt_cfg.fee_rate_one_way
                 net_invest = slot_alloc - entry_fee
                 shares = net_invest / price
@@ -911,6 +1047,7 @@ def export_backtest_csv(
             f,
             fieldnames=[
                 "代號", "公司名稱", "策略", "買進日期", "買進價格 ($)", "當時7折目標價 ($)",
+                "滿足有效軌數", "價值防禦鎖啟動", "持倉期間最大回撤 (MDD %)", "買進後持有滿1年報酬率 (%)",
                 "賣出日期", "賣出價格 ($)", "出場原因", "持有交易日",
                 "投入本金 ($)", "毛報酬率 (%)", "雙邊手續費 ($)", "淨獲利 ($)", "淨報酬率 (%)"
             ],
@@ -924,6 +1061,10 @@ def export_backtest_csv(
                 "買進日期": t.entry_date,
                 "買進價格 ($)": t.entry_price,
                 "當時7折目標價 ($)": t.target_price_at_entry,
+                "滿足有效軌數": f"{t.matched_tracks}軌",
+                "價值防禦鎖啟動": "是 (強制鎖定30%試單)" if t.circuit_breaker_active else "否",
+                "持倉期間最大回撤 (MDD %)": f"{t.holding_max_drawdown_pct:.2f}%",
+                "買進後持有滿1年報酬率 (%)": f"{t.one_year_return_pct:.2f}%",
                 "賣出日期": t.exit_date,
                 "賣出價格 ($)": t.exit_price,
                 "出場原因": t.exit_reason,
@@ -1169,20 +1310,25 @@ def export_backtest_html(
   </div>
 
   <div id="p-trades" class="panel card">
-    <h2>📜 2021–2026 歷史觸發買進與出場明細紀錄</h2>
+    <h2>📜 2021–2026 歷史觸發買進與出場明細紀錄 (含持倉 MDD 與滿 1 年真實報酬檢驗)</h2>
     <div style="overflow-x:auto;">
       <table>
         <thead>
           <tr>
             <th>代號</th>
             <th>公司名稱</th>
+            <th>滿足軌數</th>
+            <th>價值防禦鎖</th>
             <th>買進日期</th>
             <th>買進價 ($)</th>
             <th>當時7折目標價 ($)</th>
+            <th>持倉期間最大回撤 (MDD)</th>
+            <th>買進滿1年實際報酬</th>
             <th>賣出日期</th>
             <th>賣出價 ($)</th>
             <th>出場原因</th>
             <th>持有交易日</th>
+            <th>投入本金 ($)</th>
             <th>雙邊手續費 ($)</th>
             <th>單筆淨獲利 ($)</th>
             <th>單筆淨報酬 (%)</th>
@@ -1191,6 +1337,20 @@ def export_backtest_html(
         <tbody id="trades-tbody"></tbody>
       </table>
     </div>
+  </div>
+
+  <!-- 關鍵警示：META 2022 七折崩跌案實證 -->
+  <div class="card" style="border-left:4px solid #f43f5e;background:rgba(244,63,94,0.06);">
+    <h2 style="color:#f43f5e;">💥 歷史血淋淋實證：2022 META 七折崩跌案（單一案例證明 7 折估價絕不能限制虧損幅度）</h2>
+    <p style="color:var(--text-main);margin-bottom:10px;font-size:0.92rem;">
+      <strong>歷史事實重現：</strong>META 於 2021 年高點 $384.33 回檔，2022 年初觸及 52 週高點 7 折價（約 $269）觸發技術面買進訊號。然而，隨後因元宇宙巨額 Capex 燒錢與廣告指引下修，股價未見反彈，反而一路崩跌至 2022 年 11 月的 <strong>$88.09</strong>！
+    </p>
+    <ul style="color:var(--text-muted);font-size:0.88rem;margin-left:20px;line-height:1.7;">
+      <li><strong>持倉期間最大回撤 (MDD)：</strong>自 7 折買進價 $269 崩跌至 $88.09，持倉期間浮虧高達 <span style="color:#f43f5e;font-weight:700;">-67.2%</span>（若自歷史高點計則達 -77.1%）。</li>
+      <li><strong>買進後持有滿 1 年報酬率：</strong>滿一年（2023 年初）股價約 $130，單筆報酬率為 <span style="color:#f43f5e;font-weight:700;">-51.7% ~ -68.9%</span>。</li>
+      <li><strong>長抱至 2025/2026 年結果：</strong>受惠於 2023 效率之年大裁員與 AI 變現，持有至 2025 年底回升至 +109.5%。</li>
+      <li><strong>核心啟示：</strong>「7 折買進絕非保證不賠的安全氣囊」，單一優質個股亦可能面臨長達一年腰斬再腰斬的極端回撤。這正是為何系統強制要求：<strong>① 50% 核心穩健資產（35% CSPX / 15% BND）為基底、② 單一衛星個股上限 5%、③ 觸發防禦鎖強制限制 30% 試單倉</strong>，三道防火牆缺一不可！</li>
+    </ul>
   </div>
 </div>
 
@@ -1254,22 +1414,31 @@ def export_backtest_html(
     </tr>
   `).join('');
 
-  document.getElementById('trades-tbody').innerHTML = TRADES.map(t => `
+  document.getElementById('trades-tbody').innerHTML = TRADES.map(t => {{
+    const cbText = t.circuit_breaker_active ? '<span style="color:#f59e0b;">🛡️ 鎖定30%</span>' : '正常';
+    const mddClass = t.holding_max_drawdown_pct < -30 ? 'neg' : '';
+    const y1Class = t.one_year_return_pct >= 0 ? 'pos' : 'neg';
+    return `
     <tr>
       <td><strong style="color:var(--accent-blue);">${{t.ticker}}</strong></td>
       <td>${{t.name}}</td>
+      <td>${{t.matched_tracks || 1}} 軌</td>
+      <td>${{cbText}}</td>
       <td>${{t.entry_date}}</td>
       <td>$${{t.entry_price.toFixed(2)}}</td>
       <td>$${{t.target_price_at_entry.toFixed(2)}}</td>
+      <td class="${{mddClass}}">${{(t.holding_max_drawdown_pct || 0).toFixed(2)}}%</td>
+      <td class="${{y1Class}}">${{(t.one_year_return_pct || 0).toFixed(2)}}%</td>
       <td>${{t.exit_date}}</td>
       <td>$${{t.exit_price.toFixed(2)}}</td>
       <td>${{t.exit_reason}}</td>
       <td>${{t.holding_days}} 天</td>
+      <td>$${{(t.invested_amount || 10000).toLocaleString()}}</td>
       <td>$${{t.total_fee_usd.toFixed(2)}}</td>
       <td class="${{t.net_profit_usd >= 0 ? 'pos' : 'neg'}}">${{t.net_profit_usd >= 0 ? '+' : ''}}$${{t.net_profit_usd.toFixed(2)}}</td>
       <td class="${{t.net_return_pct >= 0 ? 'pos' : 'neg'}}">${{t.net_return_pct >= 0 ? '+' : ''}}${{t.net_return_pct.toFixed(2)}}%</td>
-    </tr>
-  `).join('');
+    </tr>`;
+  }}).join('');
 
   function drawChart() {{
     const svg = document.getElementById('equity-svg');
